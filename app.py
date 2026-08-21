@@ -201,6 +201,64 @@ def _run_sql(conn, sql: str, params: tuple | list | None = None):
     return conn.execute(sql, params)
 
 
+def rows_as_dicts(cursor) -> list[dict]:
+    """Normalize fetchall() results for sqlite3 and libsql/Turso."""
+    raw = cursor.fetchall()
+    if not raw:
+        return []
+    first = raw[0]
+    if isinstance(first, sqlite3.Row):
+        return [dict(r) for r in raw]
+    if isinstance(first, dict):
+        return list(raw)
+    cols = []
+    try:
+        cols = [d[0] for d in cursor.description]
+    except Exception:
+        pass
+    if cols:
+        return [dict(zip(cols, r)) for r in raw]
+    return [{"_col0": r[0]} if isinstance(r, (tuple, list)) and len(r) == 1 else {"row": r} for r in raw]
+
+
+def row_as_dict(cursor, row) -> dict | None:
+    if row is None:
+        return None
+    if isinstance(row, sqlite3.Row):
+        return dict(row)
+    if isinstance(row, dict):
+        return row
+    cols = []
+    try:
+        cols = [d[0] for d in cursor.description]
+    except Exception:
+        pass
+    if cols and isinstance(row, (tuple, list)):
+        return dict(zip(cols, row))
+    return None
+
+
+def q_all(conn, sql: str, params: tuple | list | None = None) -> list[dict]:
+    cur = _run_sql(conn, sql, params)
+    return rows_as_dicts(cur)
+
+
+def q_one(conn, sql: str, params: tuple | list | None = None) -> dict | None:
+    cur = _run_sql(conn, sql, params)
+    return row_as_dict(cur, cur.fetchone())
+
+
+def row_get(row, key: str, default=None):
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except Exception:
+        return default
+
+
 def init_db() -> None:
     conn = get_conn()
     for stmt in SCHEMA_STATEMENTS:
@@ -250,16 +308,17 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         return f"[Could not extract text: {exc}]"
 
 
-def get_circuit(conn: sqlite3.Connection, circuit_number: str) -> sqlite3.Row | None:
-    return conn.execute(
+def get_circuit(conn, circuit_number: str) -> dict | None:
+    return q_one(
+        conn,
         "SELECT * FROM circuits WHERE circuit_number = ?",
         (circuit_number.strip(),),
-    ).fetchone()
+    )
 
 
 def get_or_create_circuit(
-    conn: sqlite3.Connection, circuit_number: str, circuit_type: str = "unknown"
-) -> sqlite3.Row:
+    conn, circuit_number: str, circuit_type: str = "unknown"
+) -> dict:
     row = get_circuit(conn, circuit_number)
     if row:
         return row
@@ -268,11 +327,13 @@ def get_or_create_circuit(
         (circuit_number.strip(), circuit_type, now_iso()),
     )
     conn.commit()
-    return get_circuit(conn, circuit_number)
+    created = get_circuit(conn, circuit_number)
+    return created or {"circuit_number": circuit_number.strip(), "id": None}
 
 
-def get_light_sequence(conn: sqlite3.Connection, circuit_number: str, light_number: str) -> int | None:
-    row = conn.execute(
+def get_light_sequence(conn, circuit_number: str, light_number: str) -> int | None:
+    row = q_one(
+        conn,
         """
         SELECT cl.sequence
         FROM circuit_lights cl
@@ -280,8 +341,8 @@ def get_light_sequence(conn: sqlite3.Connection, circuit_number: str, light_numb
         WHERE c.circuit_number = ? AND cl.light_number = ?
         """,
         (circuit_number.strip(), str(light_number).strip()),
-    ).fetchone()
-    if row and row["sequence"] is not None:
+    )
+    if row and row.get("sequence") is not None:
         return int(row["sequence"])
     return None
 
@@ -293,17 +354,14 @@ def _norm(value: str | None) -> str:
 def ticket_units(row) -> list[str]:
     units = []
     for key in ("light_number", "lub", "fud"):
-        try:
-            val = _norm(row[key] if not isinstance(row, dict) else row.get(key))
-        except (KeyError, IndexError):
-            val = ""
+        val = _norm(str(row_get(row, key, "") or ""))
         if val:
             units.append(val)
     return units
 
 
 def check_duplicate(
-    conn: sqlite3.Connection,
+    conn,
     circuit_number: str,
     light_number: str | None,
     lub: str | None = None,
@@ -316,7 +374,8 @@ def check_duplicate(
     fud = _norm(fud)
     new_units = [u for u in (light_number, lub, fud) if u]
 
-    active = conn.execute(
+    active = q_all(
+        conn,
         """
         SELECT id, light_number, lub, fud, ticket_type, created_at, pedestal_cut
         FROM tickets
@@ -324,28 +383,28 @@ def check_duplicate(
         ORDER BY created_at
         """,
         (circuit_number,),
-    ).fetchall()
+    )
 
     if not active:
         return False, "", None
 
     circuit = get_circuit(conn, circuit_number)
-    ctype = (circuit["circuit_type"] if circuit else "unknown") or "unknown"
+    ctype = (circuit.get("circuit_type") if circuit else "unknown") or "unknown"
 
     for t in active:
         existing = ticket_units(t)
         if new_units and set(new_units) & set(existing):
             reason = (
-                f"Same unit already on ticket #{t['id']} "
-                f"({t['ticket_type']}, LUB {t['lub'] or '—'} / FUD {t['fud'] or '—'}, {t['created_at']})"
+                f"Same unit already on ticket #{t.get('id')} "
+                f"({t.get('ticket_type')}, LUB {t.get('lub') or '—'} / FUD {t.get('fud') or '—'}, {t.get('created_at')})"
             )
-            return True, reason, t["id"]
+            return True, reason, t.get("id")
 
         new_seqs = [get_light_sequence(conn, circuit_number, u) for u in new_units]
         new_seqs = [s for s in new_seqs if s is not None]
-        t_fud_seq = get_light_sequence(conn, circuit_number, t["fud"] or "")
-        t_lub_seq = get_light_sequence(conn, circuit_number, t["lub"] or "")
-        t_light_seq = get_light_sequence(conn, circuit_number, t["light_number"] or "")
+        t_fud_seq = get_light_sequence(conn, circuit_number, t.get("fud") or "")
+        t_lub_seq = get_light_sequence(conn, circuit_number, t.get("lub") or "")
+        t_light_seq = get_light_sequence(conn, circuit_number, t.get("light_number") or "")
         break_after = t_lub_seq
         dark_from = t_fud_seq if t_fud_seq is not None else t_light_seq
 
@@ -355,12 +414,12 @@ def check_duplicate(
                 at_or_after_fud = dark_from is not None and ns >= dark_from
                 if after_lub or at_or_after_fud:
                     reason = (
-                        f"Same break as ticket #{t['id']} — new unit is at/after "
-                        f"LUB {t['lub'] or '—'} / FUD {t['fud'] or t['light_number'] or '—'}. "
+                        f"Same break as ticket #{t.get('id')} — new unit is at/after "
+                        f"LUB {t.get('lub') or '—'} / FUD {t.get('fud') or t.get('light_number') or '—'}. "
                         f"Break is between last unit burning and first unit dark "
                         f"(series run or wires cut in a pedestal)."
                     )
-                    return True, reason, t["id"]
+                    return True, reason, t.get("id")
 
         new_fud_seq = get_light_sequence(conn, circuit_number, fud) if fud else None
         new_lub_seq = get_light_sequence(conn, circuit_number, lub) if lub else None
@@ -373,14 +432,14 @@ def check_duplicate(
             overlap = not (new_fud_seq < t_lub_seq or new_lub_seq > t_fud_seq)
             if overlap:
                 reason = (
-                    f"LUB/FUD range overlaps ticket #{t['id']} "
-                    f"(existing LUB {t['lub']} / FUD {t['fud']})."
+                    f"LUB/FUD range overlaps ticket #{t.get('id')} "
+                    f"(existing LUB {t.get('lub')} / FUD {t.get('fud')})."
                 )
-                return True, reason, t["id"]
+                return True, reason, t.get("id")
 
-    ids = ", ".join(f"#{t['id']}" for t in active)
+    ids = ", ".join(f"#{t.get('id')}" for t in active)
     summary = "; ".join(
-        f"#{t['id']} LUB {t['lub'] or '—'} FUD {t['fud'] or t['light_number'] or '—'}"
+        f"#{t.get('id')} LUB {t.get('lub') or '—'} FUD {t.get('fud') or t.get('light_number') or '—'}"
         for t in active
     )
     extra = (
@@ -392,7 +451,7 @@ def check_duplicate(
     elif ctype == "series":
         extra += " Series: everything after the break stays dark."
     reason = f"{len(active)} active ticket(s) on circuit {circuit_number} ({ids}). {summary}. {extra}"
-    return True, reason, active[0]["id"]
+    return True, reason, active[0].get("id")
 
 
 def insert_ticket(
@@ -458,18 +517,18 @@ def reopen_ticket(conn: sqlite3.Connection, ticket_id: int) -> None:
     conn.commit()
 
 
-def tickets_df(conn: sqlite3.Connection, status: str | None = None) -> pd.DataFrame:
+def tickets_df(conn, status: str | None = None) -> pd.DataFrame:
     if status:
-        rows = conn.execute(
+        rows = q_all(
+            conn,
             "SELECT * FROM tickets WHERE status = ? ORDER BY created_at DESC",
             (status,),
-        ).fetchall()
+        )
     else:
-        rows = conn.execute("SELECT * FROM tickets ORDER BY created_at DESC").fetchall()
+        rows = q_all(conn, "SELECT * FROM tickets ORDER BY created_at DESC")
     if not rows:
         return pd.DataFrame()
-    df = pd.DataFrame([dict(r) for r in rows])
-    return df
+    return pd.DataFrame(rows)
 
 
 def filter_tickets(
@@ -528,7 +587,10 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         "The break is between them — series fault or wires cut in a pedestal on a parallel LED circuit."
     )
 
-    circuits = [r["circuit_number"] for r in conn.execute("SELECT circuit_number FROM circuits ORDER BY circuit_number").fetchall()]
+    circuits = [
+        r["circuit_number"]
+        for r in q_all(conn, "SELECT circuit_number FROM circuits ORDER BY circuit_number")
+    ]
 
     with st.form("new_call", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
@@ -726,15 +788,16 @@ def page_circuits(conn: sqlite3.Connection) -> None:
     )
 
     with tab_list:
-        circuits = conn.execute(
+        circuits = q_all(
+            conn,
             """
             SELECT c.*,
                    (SELECT COUNT(*) FROM circuit_lights WHERE circuit_id = c.id) AS light_count,
                    (SELECT COUNT(*) FROM circuit_pdfs WHERE circuit_id = c.id) AS pdf_count
             FROM circuits c
             ORDER BY c.circuit_number
-            """
-        ).fetchall()
+            """,
+        )
         if not circuits:
             st.info("No circuits defined yet. Add one, or log a call — the circuit will be created automatically.")
         else:
@@ -742,20 +805,21 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             for c in circuits:
                 rows.append(
                     {
-                        "Circuit": c["circuit_number"],
-                        "Type": circuit_label(c["circuit_type"]),
-                        "Lights mapped": c["light_count"],
-                        "PDFs": c["pdf_count"],
-                        "Notes": c["description"] or "",
+                        "Circuit": c.get("circuit_number"),
+                        "Type": circuit_label(c.get("circuit_type")),
+                        "Lights mapped": c.get("light_count"),
+                        "PDFs": c.get("pdf_count"),
+                        "Notes": c.get("description") or "",
                     }
                 )
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
             pick = st.selectbox(
                 "View lights on circuit",
-                [c["circuit_number"] for c in circuits],
+                [c.get("circuit_number") for c in circuits],
             )
-            lights = conn.execute(
+            lights = q_all(
+                conn,
                 """
                 SELECT cl.sequence, cl.light_number, cl.location_note
                 FROM circuit_lights cl
@@ -764,10 +828,10 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 ORDER BY COALESCE(cl.sequence, 999999), cl.light_number
                 """,
                 (pick,),
-            ).fetchall()
+            )
             if lights:
                 st.dataframe(
-                    pd.DataFrame([dict(r) for r in lights]).rename(
+                    pd.DataFrame(lights).rename(
                         columns={
                             "sequence": "Seq (from source)",
                             "light_number": "Light #",
@@ -780,7 +844,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             else:
                 st.caption("No light order stored for this circuit yet.")
 
-            pdfs = conn.execute(
+            pdfs = q_all(
+                conn,
                 """
                 SELECT p.id, p.filename, p.uploaded_at, length(p.extracted_text) AS chars
                 FROM circuit_pdfs p
@@ -789,20 +854,28 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 ORDER BY p.uploaded_at DESC
                 """,
                 (pick,),
-            ).fetchall()
+            )
             if pdfs:
                 st.write("PDFs")
                 for p in pdfs:
-                    with st.expander(f"{p['filename']}  ·  {p['uploaded_at']}"):
-                        text = conn.execute(
+                    with st.expander(f"{p.get('filename')}  ·  {p.get('uploaded_at')}"):
+                        text_row = q_one(
+                            conn,
                             "SELECT extracted_text FROM circuit_pdfs WHERE id = ?",
-                            (p["id"],),
-                        ).fetchone()["extracted_text"]
-                        st.text_area("Extracted text", text or "(no text)", height=200, key=f"pdftext_{p['id']}")
+                            (p.get("id"),),
+                        )
+                        text = (text_row or {}).get("extracted_text")
+                        st.text_area(
+                            "Extracted text",
+                            text or "(no text)",
+                            height=200,
+                            key=f"pdftext_{p.get('id')}",
+                        )
 
             search_pdf = st.text_input("Search extracted PDF text across all circuits")
             if search_pdf.strip():
-                hits = conn.execute(
+                hits = q_all(
+                    conn,
                     """
                     SELECT c.circuit_number, p.filename, p.extracted_text
                     FROM circuit_pdfs p
@@ -810,13 +883,15 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     WHERE p.extracted_text LIKE ?
                     """,
                     (f"%{search_pdf.strip()}%",),
-                ).fetchall()
+                )
                 if not hits:
                     st.write("No matches.")
                 else:
                     for h in hits:
-                        st.markdown(f"**Circuit {h['circuit_number']}** — {h['filename']}")
-                        st.caption((h["extracted_text"] or "")[:500])
+                        st.markdown(
+                            f"**Circuit {h.get('circuit_number')}** — {h.get('filename')}"
+                        )
+                        st.caption((h.get("extracted_text") or "")[:500])
 
     with tab_add:
         with st.form("add_circuit"):
@@ -867,7 +942,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         sequence = excluded.sequence,
                         location_note = excluded.location_note
                     """,
-                    (circ["id"], ln.strip(), int(seq), loc.strip() or None),
+                    (circ.get("id"), ln.strip(), int(seq), loc.strip() or None),
                 )
                 conn.commit()
                 st.success(f"Light {ln.strip()} on circuit {cn2.strip()} saved at sequence {int(seq)}.")
@@ -903,7 +978,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                             sequence = COALESCE(excluded.sequence, circuit_lights.sequence),
                             location_note = COALESCE(excluded.location_note, circuit_lights.location_note)
                         """,
-                        (circ["id"], ln, seq, loc),
+                        (circ.get("id"), ln, seq, loc),
                     )
                     n += 1
                 conn.commit()
@@ -925,7 +1000,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 INSERT INTO circuit_pdfs (circuit_id, filename, filepath, extracted_text, uploaded_at)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (circ["id"], pdf.name, str(dest), extracted, now_iso()),
+                (circ.get("id"), pdf.name, str(dest), extracted, now_iso()),
             )
             conn.commit()
             st.success(f"Stored {pdf.name} on circuit {cn.strip()}. Extracted {len(extracted)} characters of text.")
@@ -996,10 +1071,8 @@ def main() -> None:
     backend = "Turso (cloud)" if using_turso() else "Local SQLite"
     st.sidebar.caption(f"Database: **{backend}**")
 
-    row = conn.execute(
-        "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active'"
-    ).fetchone()
-    active_n = row["n"] if isinstance(row, sqlite3.Row) or hasattr(row, "keys") else row[0]
+    row = q_one(conn, "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active'")
+    active_n = (row or {}).get("n", 0)
     st.sidebar.metric("Active now", active_n)
 
     if page == "Active calls":
