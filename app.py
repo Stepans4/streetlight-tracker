@@ -26,18 +26,31 @@ DB_PATH = DATA_DIR / "tracker.db"
 
 TICKET_TYPES = [
     "Trouble",
-    "Damage",
-    "Cable Theft",
-    "Pedestal cut",
-    "Knockdown",
-    "Bad fixture",
-    "Bad igniter",
     "UGT",
+    "Damage",
+    "Knockdown",
+    "Tag Out",
+    "Bad Ballast",
+    "Bad Ignitor",
+    "Bad Fixture",
+    "Deteriorated Pole",
+    "Damaged Pedestal",
+    "Cable Theft",
+    "Wires Cut in pedestal",
     "Vandalism",
-    "Wire stolen",
-    "Tag out",
     "Other",
 ]
+TICKET_TYPE_ALIASES = {
+    "Outage": "Trouble",
+    "Wire stolen": "Cable Theft",
+    "Pedestal cut": "Wires Cut in pedestal",
+    "Bad igniter": "Bad Ignitor",
+    "Bad fixture": "Bad Fixture",
+    "Tag out": "Tag Out",
+}
+TAG_OUT_TYPES = {"Tag Out", "Tag out"}
+PEDESTAL_CUT_TYPES = {"Wires Cut in pedestal", "Pedestal cut"}
+COMPONENT_TYPES = {"Bad Fixture", "Bad fixture", "Bad Ignitor", "Bad igniter", "Bad Ballast"}
 OUTAGE_CAUSES = [
     "",
     "Natural / component (lamp, photocell, igniter, driver)",
@@ -183,7 +196,7 @@ def circuit_label(code: str | None) -> str:
 
 def display_ticket_type(val) -> str:
     s = str(val or "")
-    return "Trouble" if s == "Outage" else s
+    return TICKET_TYPE_ALIASES.get(s, s)
 
 
 def ensure_dirs() -> None:
@@ -932,7 +945,7 @@ def insert_ticket(
     is_tag_out: bool = False,
     tag_reason: str = "",
 ) -> tuple[int, bool, str]:
-    skip_dup = is_tag_out or ticket_type == "Tag out"
+    skip_dup = is_tag_out or ticket_type in TAG_OUT_TYPES
     if skip_dup:
         flagged, reason, parent = False, "", None
     else:
@@ -966,7 +979,7 @@ def insert_ticket(
             _norm(outage_cause) or None,
             _norm(photo_name) or None,
             photo_data or None,
-            1 if (is_tag_out or ticket_type == "Tag out") else 0,
+            1 if (is_tag_out or ticket_type in TAG_OUT_TYPES) else 0,
             _norm(tag_reason) or None,
         ),
     )
@@ -1296,22 +1309,20 @@ def complete_ticket(
 def board_category(row) -> str:
     """Classify a ticket for active-board filters."""
     t = str(row.get("ticket_type") or "")
-    if int(row.get("is_tag_out") or 0) == 1 or t == "Tag out":
+    if int(row.get("is_tag_out") or 0) == 1 or t in TAG_OUT_TYPES:
         return "Tag outs"
     if t in ("Cable Theft", "Wire stolen", "Vandalism"):
         return "Theft / vandalism"
     if t == "Knockdown":
         return "Knockdowns"
-    if t in ("Bad fixture", "Bad igniter"):
+    if t in COMPONENT_TYPES:
         return "Fixture / component"
     if t == "UGT":
         return "UGT"
-    if t in ("Damage",):
+    if t in ("Damage", "Deteriorated Pole", "Damaged Pedestal"):
         return "Damages"
-    if t in ("Trouble", "Outage", "Pedestal cut") or row.get("lub") or row.get("fud"):
+    if t in ("Trouble", "Outage") or t in PEDESTAL_CUT_TYPES or row.get("lub") or row.get("fud"):
         return "Circuit troubles (LUB/FUD)"
-    if t == "Damage":
-        return "Damages"
     return "All"
 
 
@@ -1441,7 +1452,7 @@ def active_tagouts_for_circuit(conn, circuit_number: str) -> list[dict]:
         FROM tickets
         WHERE status = 'active'
           AND circuit_number = ?
-          AND (is_tag_out = 1 OR ticket_type = 'Tag out')
+          AND (is_tag_out = 1 OR ticket_type IN ('Tag out', 'Tag Out'))
         ORDER BY created_at DESC
         """,
         (circuit_number.strip(),),
@@ -1632,7 +1643,7 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         crew_name = r3.text_input("Crew name", value=current_user_name())
         c1, c2, c3 = st.columns(3)
         circuit_number = c1.text_input("Circuit number *", placeholder="e.g. T1S-A")
-        map_number = c2.text_input("Map / plate #", placeholder="305")
+        map_number = c2.text_input("Light #", placeholder="305")
         outage_cause = c3.selectbox("Trouble / LUB-FUD cause", OUTAGE_CAUSES)
         force_on_tag = st.checkbox(
             "I know this circuit is tagged — log anyway",
@@ -1640,7 +1651,7 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             help="Required if there is an active tag out on this circuit (unless this ticket is the tag out).",
         )
         st.caption(
-            "Callout identifies the head (not plate # alone). Example: **1 W 1 N Mason** → `1W-1N-Mason`."
+            "Callout identifies the head (not Light # alone). Example: **1 W 1 N Mason** → `1W-1N-Mason`."
         )
         a1, a2, a3, a4, a5 = st.columns(5)
         street = a1.text_input("Street", placeholder="1 or 1st")
@@ -1668,7 +1679,7 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         f4, f5, f6 = st.columns(3)
         ugt = f4.checkbox("UGT (this light only)")
         vandalism = f5.checkbox("Vandalized")
-        wire_stolen = f6.checkbox("Wire stolen from this light")
+        wire_stolen = False
         p1, p2, p3 = st.columns(3)
         pole_material = p1.selectbox("Pole type", POLE_MATERIALS)
         pole_height = p2.text_input("Pole height", placeholder="e.g. 30 ft")
@@ -1687,7 +1698,7 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         spoken = spoken_callout(street, side, nth if nth else "", from_dir, cross)
         light_id = (callout_override or "").strip() or built or (map_number or "").strip()
         loc = location.strip() or spoken
-        ttype = "Tag out" if is_tag else ticket_type
+        ttype = "Tag Out" if is_tag else ticket_type
         if is_tag and not light_id:
             light_id = "TAGOUT"
         existing_tags = active_tagouts_for_circuit(conn, circuit_number)
@@ -1704,8 +1715,8 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         get_or_create_circuit(conn, circuit_number)
         flags = {
             "knockdown": knockdown or ttype == "Knockdown",
-            "bad_fixture": bad_fixture or ttype == "Bad fixture",
-            "bad_igniter": bad_igniter or ttype == "Bad igniter",
+            "bad_fixture": bad_fixture or ttype in ("Bad Fixture", "Bad fixture"),
+            "bad_igniter": bad_igniter or ttype in ("Bad Ignitor", "Bad igniter"),
             "ugt": ugt or ttype == "UGT",
             "vandalism": vandalism or ttype == "Vandalism",
             "wire_stolen": wire_stolen or ttype == "Wire stolen",
@@ -1732,14 +1743,14 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             desc,
             lub=lub,
             fud=fud,
-            pedestal_cut=pedestal_cut or ttype == "Pedestal cut",
+            pedestal_cut=pedestal_cut or ttype in PEDESTAL_CUT_TYPES,
             map_number=map_number,
             work_order=work_order,
             created_by=crew_name,
             outage_cause=outage_cause,
             photo_name=photo_name,
             photo_data=photo_data,
-            is_tag_out=is_tag or ttype == "Tag out",
+            is_tag_out=is_tag or ttype in TAG_OUT_TYPES,
             tag_reason=tag_reason,
         )
         if light_id and light_id != "TAGOUT":
@@ -1824,7 +1835,7 @@ def page_active(conn: sqlite3.Connection) -> None:
         "is_tag_out": "Tag out",
         "circuit_number": "Circuit",
         "light_number": "Callout",
-        "map_number": "Map #",
+        "map_number": "Light #",
         "lub": "LUB",
         "fud": "FUD",
         "outage_cause": "Cause",
@@ -1873,7 +1884,7 @@ def page_active(conn: sqlite3.Connection) -> None:
     ids = filtered["id"].tolist()
     pick = st.selectbox("Ticket #", ids)
     row = filtered[filtered["id"] == pick].iloc[0]
-    is_tag = int(row.get("is_tag_out") or 0) == 1 or str(row.get("ticket_type") or "") == "Tag out"
+    is_tag = int(row.get("is_tag_out") or 0) == 1 or str(row.get("ticket_type") or "") in TAG_OUT_TYPES
     st.caption(
         f"{display_ticket_type(row.get('ticket_type'))} · {row.get('circuit_number')} · "
         f"{row.get('light_number') or ''} · Rec {row.get('work_order') or '—'} · "
@@ -1997,7 +2008,7 @@ def page_history(conn: sqlite3.Connection) -> None:
             "is_tag_out": "Tag out",
             "circuit_number": "Circuit",
             "light_number": "Callout",
-            "map_number": "Map #",
+            "map_number": "Light #",
             "lub": "LUB",
             "fud": "FUD",
             "outage_cause": "Cause",
@@ -2158,7 +2169,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                             "Seq": seq or "—",
                             "Branch": branch_label(seq),
                             "Callout": r.get("light_number"),
-                            "Map #": r.get("map_number") or "",
+                            "Light #": r.get("map_number") or "",
                             "Spoken": spoken_callout(
                                 r.get("street") or "",
                                 r.get("side") or "",
@@ -2198,7 +2209,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         st.markdown(f"**Editing** {cur.get('light_number')}")
                         with st.form("list_edit_light"):
                             new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
-                            map_n = st.text_input("Map / plate #", value=str(cur.get("map_number") or ""))
+                            map_n = st.text_input("Light #", value=str(cur.get("map_number") or ""))
                             seq = st.text_input("Sequence", value=str(cur.get("sequence") or ""))
                             loc = st.text_input("Location note", value=str(cur.get("location_note") or ""))
                             e1, e2, e3 = st.columns(3)
@@ -2376,7 +2387,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
         )
         with st.form("add_light"):
             cn2 = st.text_input("Circuit number", key="al_cn")
-            map_n = st.text_input("Map / plate #", placeholder="305")
+            map_n = st.text_input("Light #", placeholder="305")
             b1, b2, b3, b4, b5 = st.columns(5)
             st_street = b1.text_input("Street", placeholder="1")
             st_side = b2.selectbox("Side", SIDES, key="al_side")
@@ -2482,7 +2493,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 st.caption("No lights on this circuit.")
             else:
                 labels = [
-                    f"{r.get('light_number')}  ·  map {r.get('map_number') or '—'}  ·  seq {r.get('sequence') or '—'}"
+                    f"{r.get('light_number')}  ·  #{r.get('map_number') or '—'}  ·  seq {r.get('sequence') or '—'}"
                     for r in lights_ed
                 ]
                 pick_i = st.selectbox(
@@ -2494,7 +2505,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 cur = lights_ed[pick_i]
                 with st.form("edit_light"):
                     new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
-                    map_n = st.text_input("Map / plate #", value=str(cur.get("map_number") or ""))
+                    map_n = st.text_input("Light #", value=str(cur.get("map_number") or ""))
                     e1, e2, e3, e4, e5 = st.columns(5)
                     st_street = e1.text_input("Street", value=str(cur.get("street") or ""))
                     side_val = str(cur.get("side") or "")
@@ -2890,7 +2901,7 @@ def page_light_history(conn) -> None:
     c1, c2, c3, c4 = st.columns(4)
     circuit = c1.text_input("Circuit")
     callout = c2.text_input("Callout / light ID")
-    mapn = c3.text_input("Map #")
+    mapn = c3.text_input("Light #")
     kind = c4.selectbox("Event type", ["All"] + TICKET_TYPES + ["update"])
 
     events = q_all(conn, "SELECT * FROM light_events ORDER BY created_at DESC")
@@ -2923,7 +2934,7 @@ def page_light_history(conn) -> None:
                 "Date": _fmt_when(e.get("created_at")),
                 "Circuit": e.get("circuit_number") or "",
                 "Callout": e.get("light_number") or "",
-                "Map #": e.get("map_number") or "",
+                "Light #": e.get("map_number") or "",
                 "Ticket": e.get("ticket_id") or "",
                 "Type": e.get("event_type") or "",
                 "Down": _yes(e.get("knockdown")),
@@ -2966,7 +2977,7 @@ def page_light_history(conn) -> None:
             {
                 "Circuit": cn or "",
                 "Callout": ln or "",
-                "Map #": e.get("map_number") or "",
+                "Light #": e.get("map_number") or "",
                 "Last date": _fmt_when(e.get("created_at")),
                 "Last type": e.get("event_type") or "",
                 "All flags on file": ", ".join(sorted(ever.get((cn, ln), []))) or "—",
@@ -2986,7 +2997,7 @@ def page_light_history(conn) -> None:
     col_cfg_sum = {
         "Circuit": st.column_config.TextColumn(width="small"),
         "Callout": st.column_config.TextColumn(width="medium"),
-        "Map #": st.column_config.TextColumn(width="small"),
+        "Light #": st.column_config.TextColumn(width="small"),
         "Last date": st.column_config.TextColumn(width="small"),
         "Last type": st.column_config.TextColumn(width="small"),
         "All flags on file": st.column_config.TextColumn(width="medium"),
@@ -2998,7 +3009,7 @@ def page_light_history(conn) -> None:
         "Date": st.column_config.TextColumn(width="small"),
         "Circuit": st.column_config.TextColumn(width="small"),
         "Callout": st.column_config.TextColumn(width="medium"),
-        "Map #": st.column_config.TextColumn(width="small"),
+        "Light #": st.column_config.TextColumn(width="small"),
         "Ticket": st.column_config.TextColumn(width="small"),
         "Type": st.column_config.TextColumn(width="small"),
         "Down": st.column_config.TextColumn(width="small"),
@@ -3048,7 +3059,7 @@ def page_light_history(conn) -> None:
         )
         if cur:
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Map #", cur.get("map_number") or "—")
+            m1.metric("Light #", cur.get("map_number") or "—")
             m2.metric("Pole", f"{cur.get('pole_material') or '—'} {cur.get('pole_height') or ''}".strip())
             m3.metric("Fixture", cur.get("fixture_type") or "—")
             m4.metric("Sequence", cur.get("sequence") or "—")
@@ -3115,7 +3126,7 @@ def page_address_search(conn) -> None:
                 "Score": h["score"],
                 "Circuit": h.get("circuit_number"),
                 "Callout": h.get("light_number"),
-                "Map #": h.get("map_number") or "",
+                "Light #": h.get("map_number") or "",
                 "Spoken": spoken_callout(
                     h.get("street") or "",
                     h.get("side") or "",
@@ -3228,7 +3239,7 @@ def main() -> None:
     st.sidebar.metric("Active now", active_n)
     tag_n = q_one(
         conn,
-        "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active' AND (is_tag_out = 1 OR ticket_type = 'Tag out')",
+        "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active' AND (is_tag_out = 1 OR ticket_type IN ('Tag out', 'Tag Out'))",
     )
     st.sidebar.metric("Tag outs", (tag_n or {}).get("n", 0))
 
