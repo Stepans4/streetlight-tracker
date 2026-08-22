@@ -25,7 +25,7 @@ PDF_DIR = DATA_DIR / "pdfs"
 DB_PATH = DATA_DIR / "tracker.db"
 
 TICKET_TYPES = [
-    "Outage",
+    "Trouble",
     "Damage",
     "Cable Theft",
     "Pedestal cut",
@@ -181,6 +181,11 @@ def circuit_label(code: str | None) -> str:
     return CIRCUIT_TYPE_LABELS.get(code or "unknown", code or "unknown")
 
 
+def display_ticket_type(val) -> str:
+    s = str(val or "")
+    return "Trouble" if s == "Outage" else s
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PDF_DIR.mkdir(parents=True, exist_ok=True)
@@ -205,9 +210,12 @@ def using_turso() -> bool:
 def _auth_passwords() -> dict[str, str]:
     """
     Secrets:
-      APP_PASSWORD = crew shared code
-      SUPERVISOR_PASSWORD = supervisor code
-      or [passwords] crew = "..." / supervisor = "..."
+      APP_PASSWORD / SUPERVISOR_PASSWORD  (shared role codes)
+      [passwords]
+      mike = "his-code"
+      liz = "her-code"
+      crew = "shared-truck"
+      supervisor = "shared-office"
     """
     out: dict[str, str] = {}
     crew = _secret("APP_PASSWORD")
@@ -221,7 +229,27 @@ def _auth_passwords() -> dict[str, str]:
         if block:
             for k, v in dict(block).items():
                 if v:
-                    out[str(k).lower()] = str(v)
+                    out[str(k).lower().strip()] = str(v)
+    except Exception:
+        pass
+    return out
+
+
+def _auth_roles() -> dict[str, str]:
+    """
+    [roles]
+    mike = "crew"
+    liz = "supervisor"
+    Names not listed default to crew (except the name 'supervisor').
+    """
+    out: dict[str, str] = {}
+    try:
+        block = st.secrets.get("roles")
+        if block:
+            for k, v in dict(block).items():
+                role = str(v).lower().strip()
+                if role in ("crew", "supervisor"):
+                    out[str(k).lower().strip()] = role
     except Exception:
         pass
     return out
@@ -259,27 +287,45 @@ def require_login() -> bool:
                 st.rerun()
         return True
 
+    roles_map = _auth_roles()
+    named = sorted(k for k in passwords if k not in ("crew", "supervisor"))
     st.title("Street Light Tracker")
-    st.caption("Sign in as crew or supervisor")
+    st.caption("Sign in with your name and password")
     with st.form("login"):
-        role = st.selectbox("Role", ["crew", "supervisor"])
-        name = st.text_input("Your name", placeholder="e.g. Mike")
+        name = st.text_input("Name", placeholder="mike")
+        role_pick = st.selectbox(
+            "Role (only used with the shared crew/supervisor password)",
+            ["crew", "supervisor"],
+        )
         pwd = st.text_input("Password", type="password")
         ok = st.form_submit_button("Sign in", type="primary")
     if ok:
-        expected = passwords.get(role)
-        if not expected and role == "crew":
-            expected = passwords.get("crew")
-        if expected and pwd == expected:
+        key = (name or "").strip().lower()
+        ok_login = False
+        role = "crew"
+        display = (name or "").strip() or "crew"
+        # 1) Named account: passwords.mike = "..."
+        if key and key in passwords and pwd == passwords[key]:
+            ok_login = True
+            role = roles_map.get(key) or ("supervisor" if key == "supervisor" else "crew")
+            display = name.strip()
+        # 2) Shared role password
+        elif role_pick in passwords and pwd == passwords[role_pick]:
+            ok_login = True
+            role = role_pick
+            display = (name or role_pick).strip() or role_pick
+        if ok_login:
             st.session_state.authenticated = True
             st.session_state.auth_role = role
-            st.session_state.auth_name = (name or role).strip() or role
-            st.session_state.auth_user = st.session_state.auth_name
+            st.session_state.auth_name = display
+            st.session_state.auth_user = display
             st.rerun()
-        st.error("Wrong password for that role.")
+        st.error("Wrong name or password.")
+    if named:
+        st.caption("Named logins: " + ", ".join(named))
     st.info(
-        "Secrets: `APP_PASSWORD` (crew), `SUPERVISOR_PASSWORD` (supervisor), "
-        "or `[passwords]` crew / supervisor entries."
+        "Named accounts go in Streamlit **Secrets** under `[passwords]` and `[roles]`. "
+        "Shared codes still work: `APP_PASSWORD` / `SUPERVISOR_PASSWORD`."
     )
     return False
 
@@ -1262,7 +1308,7 @@ def board_category(row) -> str:
         return "UGT"
     if t in ("Damage",):
         return "Damages"
-    if t in ("Outage", "Pedestal cut") or row.get("lub") or row.get("fud"):
+    if t in ("Trouble", "Outage", "Pedestal cut") or row.get("lub") or row.get("fud"):
         return "Circuit troubles (LUB/FUD)"
     if t == "Damage":
         return "Damages"
@@ -1279,7 +1325,7 @@ def filter_board(df: pd.DataFrame, board_filter: str) -> pd.DataFrame:
 def build_print_board_html(df: pd.DataFrame, title: str = "Active board") -> str:
     rows = []
     for _, r in df.iterrows():
-        tag = "TAG OUT" if int(r.get("is_tag_out") or 0) else (r.get("ticket_type") or "")
+        tag = "TAG OUT" if int(r.get("is_tag_out") or 0) else display_ticket_type(r.get("ticket_type"))
         cause = r.get("outage_cause") or ""
         rows.append(
             f"<tr>"
@@ -1312,7 +1358,7 @@ th {{ background: #eee; }}
 <table>
 <thead><tr>
 <th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>
-<th>Cause</th><th>WO</th><th>Crew</th><th>Location</th><th>Notes / tag</th>
+<th>Cause</th><th>Record #</th><th>Crew</th><th>Location</th><th>Notes / tag</th>
 </tr></thead>
 <tbody>{body}</tbody>
 </table>
@@ -1465,7 +1511,7 @@ def build_shift_sheet_html(conn) -> str:
         parts = [
             "<table><thead><tr>"
             "<th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>"
-            "<th>Cause</th><th>WO</th><th>Crew</th><th>When</th><th>Notes</th>"
+            "<th>Cause</th><th>Record #</th><th>Crew</th><th>When</th><th>Notes</th>"
             "</tr></thead><tbody>"
         ]
         for r in rows:
@@ -1579,29 +1625,15 @@ def page_new_call(conn: sqlite3.Connection) -> None:
     if photo_err:
         st.error(photo_err)
 
-    # Live tag-out check when circuit typed in session (outside form for visibility)
-    circ_preview = st.text_input("Circuit to check for tag outs", key="tag_check_circ", placeholder="e.g. T1S-A")
-    if circ_preview.strip():
-        tags = active_tagouts_for_circuit(conn, circ_preview)
-        if tags:
-            for t in tags:
-                st.warning(
-                    f"**Circuit {circ_preview.strip()} is TAG OUT** — ticket #{t.get('id')}: "
-                    f"{t.get('tag_reason') or t.get('description') or 'no reason'} "
-                    f"(by {t.get('created_by') or '—'} · {str(t.get('created_at') or '')[:16]})"
-                )
-        else:
-            st.caption(f"No active tag out on {circ_preview.strip()}.")
-
     with st.form("new_call", clear_on_submit=True):
         r1, r2, r3 = st.columns(3)
         ticket_type = r1.selectbox("Type", TICKET_TYPES)
-        work_order = r2.text_input("Work order #", placeholder="city / WO number")
+        work_order = r2.text_input("Record #", placeholder="city record number")
         crew_name = r3.text_input("Crew name", value=current_user_name())
         c1, c2, c3 = st.columns(3)
         circuit_number = c1.text_input("Circuit number *", placeholder="e.g. T1S-A")
         map_number = c2.text_input("Map / plate #", placeholder="305")
-        outage_cause = c3.selectbox("Outage / LUB-FUD cause", OUTAGE_CAUSES)
+        outage_cause = c3.selectbox("Trouble / LUB-FUD cause", OUTAGE_CAUSES)
         force_on_tag = st.checkbox(
             "I know this circuit is tagged — log anyway",
             value=False,
@@ -1747,7 +1779,7 @@ def page_active(conn: sqlite3.Connection) -> None:
     c1, c2, c3, c4 = st.columns(4)
     q = c1.text_input("Search")
     circuit = c2.text_input("Circuit")
-    wo = c3.text_input("Work order #")
+    wo = c3.text_input("Record #")
     board = c4.selectbox("Board filter", BOARD_FILTERS)
     if not truck:
         light = st.text_input("Light / callout")
@@ -1796,7 +1828,7 @@ def page_active(conn: sqlite3.Connection) -> None:
         "lub": "LUB",
         "fud": "FUD",
         "outage_cause": "Cause",
-        "work_order": "WO #",
+        "work_order": "Record #",
         "created_by": "Crew",
         "tag_reason": "Tag reason",
         "pedestal_cut": "Pedestal cut",
@@ -1812,6 +1844,8 @@ def page_active(conn: sqlite3.Connection) -> None:
         show["Flagged"] = show["Flagged"].map({1: "YES", 0: ""})
     if "Pedestal cut" in show.columns:
         show["Pedestal cut"] = show["Pedestal cut"].map({1: "YES", 0: ""})
+    if "Type" in show.columns:
+        show["Type"] = show["Type"].map(display_ticket_type)
     st.dataframe(show, use_container_width=True, hide_index=True)
 
     if not truck:
@@ -1841,8 +1875,8 @@ def page_active(conn: sqlite3.Connection) -> None:
     row = filtered[filtered["id"] == pick].iloc[0]
     is_tag = int(row.get("is_tag_out") or 0) == 1 or str(row.get("ticket_type") or "") == "Tag out"
     st.caption(
-        f"{row.get('ticket_type')} · {row.get('circuit_number')} · "
-        f"{row.get('light_number') or ''} · WO {row.get('work_order') or '—'} · "
+        f"{display_ticket_type(row.get('ticket_type'))} · {row.get('circuit_number')} · "
+        f"{row.get('light_number') or ''} · Rec {row.get('work_order') or '—'} · "
         f"cause: {row.get('outage_cause') or '—'}"
     )
     if is_tag:
@@ -1914,7 +1948,7 @@ def page_history(conn: sqlite3.Connection) -> None:
     q = c1.text_input("Keyword")
     circuit = c2.text_input("Circuit")
     light = c3.text_input("Light #")
-    wo = c4.text_input("Work order #")
+    wo = c4.text_input("Record #")
     ttype = st.selectbox("Type", ["All"] + TICKET_TYPES)
 
     c5, c6, c7 = st.columns(3)
@@ -1967,7 +2001,7 @@ def page_history(conn: sqlite3.Connection) -> None:
             "lub": "LUB",
             "fud": "FUD",
             "outage_cause": "Cause",
-            "work_order": "WO #",
+            "work_order": "Record #",
             "created_by": "Opened by",
             "completed_by": "Closed by",
             "findings": "Findings",
@@ -1983,6 +2017,8 @@ def page_history(conn: sqlite3.Connection) -> None:
         show["Tag out"] = show["Tag out"].map({1: "YES", 0: ""})
     if "Pedestal cut" in show.columns:
         show["Pedestal cut"] = show["Pedestal cut"].map({1: "YES", 0: ""})
+    if "Type" in show.columns:
+        show["Type"] = show["Type"].map(display_ticket_type)
     st.dataframe(show, use_container_width=True, hide_index=True)
 
     csv_bytes = show.to_csv(index=False).encode("utf-8")
@@ -2017,9 +2053,15 @@ def page_circuits(conn: sqlite3.Connection) -> None:
         "Same-leg downstream only is flagged as the same break."
     )
 
-    tab_list, tab_add, tab_edit, tab_import, tab_pdf = st.tabs(
-        ["Circuit list", "Add circuit", "Edit / delete", "Import light order", "Upload PDF"]
-    )
+    can_edit = is_supervisor()
+    if can_edit:
+        tab_list, tab_add, tab_edit, tab_import, tab_pdf = st.tabs(
+            ["Circuit list", "Add circuit", "Edit / delete", "Import light order", "Upload PDF"]
+        )
+    else:
+        tab_list = st.container()
+        tab_add = tab_edit = tab_import = tab_pdf = None
+        st.caption("Crew view — look up circuits and lights only. Supervisor can edit maps.")
 
     with tab_list:
         circuits = q_all(
@@ -2053,14 +2095,15 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 [c.get("circuit_number") for c in circuits],
             )
             picked = next((c for c in circuits if c.get("circuit_number") == pick), None)
-            a1, a2, a3 = st.columns([2, 1, 1])
             a1.write(f"Selected **{pick}**")
-            if a2.button("Edit circuit", key=f"btn_edit_circ_{pick}"):
-                st.session_state["edit_circuit"] = pick
-            if a3.button("Delete circuit", key=f"btn_del_circ_{pick}"):
-                if picked and picked.get("id") is not None:
-                    st.session_state["delete_circuit"] = pick
-                    st.session_state["delete_circuit_id"] = picked.get("id")
+            if can_edit:
+                a2, a3 = st.columns(2)
+                if a2.button("Edit circuit", key=f"btn_edit_circ_{pick}"):
+                    st.session_state["edit_circuit"] = pick
+                if a3.button("Delete circuit", key=f"btn_del_circ_{pick}"):
+                    if picked and picked.get("id") is not None:
+                        st.session_state["delete_circuit"] = pick
+                        st.session_state["delete_circuit_id"] = picked.get("id")
 
             if st.session_state.get("delete_circuit") == pick and picked:
                 _open_delete_circuit_dialog(picked.get("id"), pick)
@@ -2136,16 +2179,17 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
-                st.caption("Edit / delete a light below")
-                for r in lights:
-                    lid = r.get("id")
-                    lab = f"{r.get('light_number')}  ·  #{r.get('map_number') or '—'}  ·  {r.get('sequence') or '—'}"
-                    c_l, c_e, c_d = st.columns([4, 1, 1])
-                    c_l.write(lab)
-                    if c_e.button("Edit", key=f"edit_l_{lid}"):
-                        st.session_state["edit_light_id"] = lid
-                    if c_d.button("Delete", key=f"del_l_{lid}"):
-                        st.session_state["delete_light_id"] = lid
+                if can_edit:
+                    st.caption("Edit / delete a light below")
+                    for r in lights:
+                        lid = r.get("id")
+                        lab = f"{r.get('light_number')}  ·  #{r.get('map_number') or '—'}  ·  {r.get('sequence') or '—'}"
+                        c_l, c_e, c_d = st.columns([4, 1, 1])
+                        c_l.write(lab)
+                        if c_e.button("Edit", key=f"edit_l_{lid}"):
+                            st.session_state["edit_light_id"] = lid
+                        if c_d.button("Delete", key=f"del_l_{lid}"):
+                            st.session_state["delete_light_id"] = lid
 
                 edit_id = st.session_state.get("edit_light_id")
                 if edit_id:
@@ -2293,7 +2337,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         )
                         st.caption((h.get("extracted_text") or "")[:500])
 
-    with tab_add:
+    if can_edit:
+      with tab_add:
         with st.form("add_circuit"):
             cn = st.text_input("Circuit number")
             ct = st.selectbox(
@@ -2410,7 +2455,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     except sqlite3.Error as e:
                         st.error(str(e))
 
-    with tab_edit:
+    if can_edit:
+      with tab_edit:
         st.subheader("Edit or delete a light")
         circs = q_all(conn, "SELECT circuit_number FROM circuits ORDER BY circuit_number")
         circ_opts = [r.get("circuit_number") for r in circs]
@@ -2566,7 +2612,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 if row:
                     _open_delete_circuit_dialog(row.get("id"), dcn)
 
-    with tab_import:
+    if can_edit:
+      with tab_import:
         st.write(
             "CSV columns: `circuit_number,light_number,sequence,location` "
             "plus optional `map_number,street,side,nth,from_dir,cross_street`."
@@ -2646,7 +2693,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     st.warning("Skipped invalid sequences:\n" + "\n".join(skipped[:20]))
                 st.rerun()
 
-    with tab_pdf:
+    if can_edit:
+      with tab_pdf:
         cn = st.text_input("Attach PDF to circuit number")
         pdf = st.file_uploader("Circuit PDF", type=["pdf"])
         if st.button("Upload PDF") and cn.strip() and pdf:
@@ -3133,7 +3181,7 @@ def main() -> None:
     conn = get_conn()
 
     st.title("Street Light Tracker")
-    st.caption("Outages · damage · cable theft — LUB / FUD, active log, history")
+    st.caption("Troubles · damage · cable theft — LUB / FUD, active log, history")
     if st.session_state.get("flash_ok"):
         st.success(st.session_state.pop("flash_ok"))
     if st.session_state.get("flash_err"):
@@ -3157,13 +3205,14 @@ def main() -> None:
             "Reports",
         ]
     else:
-        # Crew: no Circuits/Backup (supervisor only)
+        # Crew: view circuits, no Backup
         nav = [
             "Active calls",
             "New call",
             "Address search",
             "Light history",
             "History",
+            "Circuits & maps",
             "Reports",
         ]
 
@@ -3172,7 +3221,7 @@ def main() -> None:
     backend = "Turso (cloud)" if using_turso() else "Local SQLite"
     st.sidebar.caption(f"Database: **{backend}**")
     if not is_supervisor():
-        st.sidebar.caption("Crew view — Circuits & Backup need supervisor login")
+        st.sidebar.caption("Crew view — circuits are view-only; Backup is supervisor only")
 
     row = q_one(conn, "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active'")
     active_n = (row or {}).get("n", 0)
@@ -3196,10 +3245,7 @@ def main() -> None:
     elif page == "History":
         page_history(conn)
     elif page == "Circuits & maps":
-        if not is_supervisor():
-            st.warning("Circuits & maps is supervisor only.")
-        else:
-            page_circuits(conn)
+        page_circuits(conn)
     else:
         page_reports(conn)
 
