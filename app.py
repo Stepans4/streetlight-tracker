@@ -835,7 +835,7 @@ def light_affected_by_ticket(conn, circuit_number: str, ticket: dict, light_numb
     ln = _norm(light_number)
     seq = normalize_seq(sequence) or get_light_sequence(conn, circuit_number, ln) if ln else normalize_seq(sequence)
     units = ticket_units(ticket)
-    if ln and ln in units:
+    if ln and any(loc_keys_match(ln, u) for u in units):
         return "listed on this ticket (location / LUB / FUD)"
     ttype = display_ticket_type(ticket.get("ticket_type"))
     if int(ticket.get("is_tag_out") or 0) == 1 or ttype in TAG_OUT_TYPES:
@@ -898,23 +898,44 @@ def show_lookup_warnings(notes: list[str]) -> None:
 
 
 def get_light_sequence(conn, circuit_number: str, light_number: str) -> str | None:
-    row = q_one(
+    if not (circuit_number or "").strip() or not str(light_number or "").strip():
+        return None
+    lights = q_all(
         conn,
         """
-        SELECT cl.sequence
+        SELECT cl.sequence, cl.light_number, cl.map_number
         FROM circuit_lights cl
         JOIN circuits c ON c.id = cl.circuit_id
-        WHERE c.circuit_number = ? AND cl.light_number = ?
+        WHERE c.circuit_number = ?
         """,
-        (circuit_number.strip(), str(light_number).strip()),
+        (circuit_number.strip(),),
     )
-    if row and row.get("sequence") not in (None, ""):
-        return normalize_seq(row["sequence"])
+    want = loc_key(light_number)
+    if not want:
+        return None
+    for row in lights:
+        if loc_key(row.get("light_number")) == want or loc_key(row.get("map_number")) == want:
+            if row.get("sequence") not in (None, ""):
+                return normalize_seq(row["sequence"])
+            return None
     return None
 
 
 def _norm(value: str | None) -> str:
     return (value or "").strip()
+
+
+def loc_key(value) -> str:
+    """Compare locations ignoring spaces, hyphens, and similar punctuation."""
+    s = str(value or "").strip().lower()
+    for ch in (" ", "-", "_", "/", ".", ",", ";", ":"):
+        s = s.replace(ch, "")
+    return s
+
+
+def loc_keys_match(a, b) -> bool:
+    ka, kb = loc_key(a), loc_key(b)
+    return bool(ka and kb and ka == kb)
 
 
 def ticket_units(row) -> list[str]:
@@ -959,7 +980,7 @@ def check_duplicate(
 
     for t in active:
         existing = ticket_units(t)
-        if new_units and set(new_units) & set(existing):
+        if new_units and existing and any(loc_keys_match(a, b) for a in new_units for b in existing):
             reason = (
                 f"Same unit already on ticket #{t.get('id')} "
                 f"({t.get('ticket_type')}, LUB {t.get('lub') or '—'} / FUD {t.get('fud') or '—'}, {t.get('created_at')})"
@@ -3393,8 +3414,7 @@ def match_sequence_on_circuit(lights: list[dict], ref: str) -> str | None:
             return seq
         if normalize_seq(r.get("map_number")) == ref_n:
             return seq or None
-        ln = str(r.get("light_number") or "").strip().lower()
-        if ln and ln == str(ref or "").strip().lower():
+        if loc_keys_match(r.get("light_number"), ref) or loc_keys_match(r.get("map_number"), ref):
             return seq or None
     # bare sequence typed as LUB/FUD
     if is_valid_sequence(ref) and normalize_seq(ref):
