@@ -3138,6 +3138,151 @@ def page_address_search(conn) -> None:
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
+def circuit_lights_list(conn, circuit_number: str) -> list[dict]:
+    return q_all(
+        conn,
+        """
+        SELECT cl.id, cl.sequence, cl.light_number, cl.map_number, cl.location_note
+        FROM circuit_lights cl
+        JOIN circuits c ON c.id = cl.circuit_id
+        WHERE c.circuit_number = ?
+        """,
+        (circuit_number.strip(),),
+    )
+
+
+def match_sequence_on_circuit(lights: list[dict], ref: str) -> str | None:
+    """Match LUB/FUD/location text to a mapped light's sequence."""
+    ref_n = normalize_seq(ref)
+    if not ref_n:
+        return None
+    for r in lights:
+        seq = normalize_seq(r.get("sequence"))
+        if seq and (seq == ref_n or normalize_seq(r.get("light_number")) == ref_n):
+            return seq
+        if normalize_seq(r.get("map_number")) == ref_n:
+            return seq or None
+        ln = str(r.get("light_number") or "").strip().lower()
+        if ln and ln == str(ref or "").strip().lower():
+            return seq or None
+    # bare sequence typed as LUB/FUD
+    if is_valid_sequence(ref) and normalize_seq(ref):
+        return normalize_seq(ref)
+    return None
+
+
+def dark_keys_for_ticket(conn, ticket: dict, cache: dict) -> tuple[set[str], str]:
+    """
+    Unique keys for lights treated as out on this ticket.
+    Key format: circuit|sequence_or_id
+    Returns (keys, method label).
+    """
+    cn = str(ticket.get("circuit_number") or "").strip()
+    ttype = display_ticket_type(ticket.get("ticket_type"))
+    is_tag = int(ticket.get("is_tag_out") or 0) == 1 or ttype in TAG_OUT_TYPES
+    keys: set[str] = set()
+
+    if not cn:
+        return keys, "no circuit"
+
+    if cn not in cache:
+        cache[cn] = circuit_lights_list(conn, cn)
+    lights = cache[cn]
+
+    lub = _norm(str(ticket.get("lub") or ""))
+    fud = _norm(str(ticket.get("fud") or ""))
+    loc = _norm(str(ticket.get("light_number") or ticket.get("location") or ""))
+    map_n = _norm(str(ticket.get("map_number") or ""))
+
+    # Tag out / feeder down: all mapped heads on the circuit
+    if is_tag:
+        if lights:
+            for r in lights:
+                ident = normalize_seq(r.get("sequence")) or str(r.get("id"))
+                keys.add(f"{cn}|{ident}")
+            return keys, f"tag out — all {len(keys)} mapped"
+        keys.add(f"{cn}|TAG")
+        return keys, "tag out — circuit not mapped (count 1)"
+
+    # LUB/FUD stretch: FUD and everything same-branch after it
+    fud_seq = match_sequence_on_circuit(lights, fud) if fud else None
+    lub_seq = match_sequence_on_circuit(lights, lub) if lub else None
+    if fud_seq and lights:
+        for r in lights:
+            seq = normalize_seq(r.get("sequence"))
+            if not seq:
+                continue
+            if same_branch_at_or_after(seq, fud_seq):
+                keys.add(f"{cn}|{seq}")
+        if keys:
+            return keys, f"LUB/FUD stretch from {fud_seq} ({len(keys)} mapped)"
+    if (lub or fud) and not keys:
+        # has LUB/FUD text but no map match — still at least the reported stretch
+        keys.add(f"{cn}|FUD:{fud or lub}")
+        return keys, "LUB/FUD — not fully mapped (count 1)"
+
+    # Single-head / local trouble
+    single_types = {
+        "UGT",
+        "Knockdown",
+        "Bad Fixture",
+        "Bad Ignitor",
+        "Bad Ballast",
+        "Deteriorated Pole",
+        "Damaged Pedestal",
+        "Vandalism",
+        "Damage",
+        "Cable Theft",
+        "Wires Cut in pedestal",
+        "Trouble",
+        "Other",
+    }
+    if ttype in single_types or True:
+        # Prefer matching one mapped light by location / light #
+        target = loc or map_n
+        if target and lights:
+            for r in lights:
+                if normalize_seq(r.get("light_number")) == normalize_seq(target):
+                    ident = normalize_seq(r.get("sequence")) or str(r.get("id"))
+                    keys.add(f"{cn}|{ident}")
+                    return keys, "single mapped light"
+                if map_n and normalize_seq(r.get("map_number")) == normalize_seq(map_n):
+                    ident = normalize_seq(r.get("sequence")) or str(r.get("id"))
+                    keys.add(f"{cn}|{ident}")
+                    return keys, "single mapped light #"
+        # Wires cut without FUD: if parallel pedestal, unknown stretch — count 1
+        keys.add(f"{cn}|{normalize_seq(target) or ticket.get('id')}")
+        return keys, "single call (1)"
+
+    return keys, "unknown"
+
+
+def estimate_lights_out(conn, active_df: pd.DataFrame) -> tuple[int, list[dict], set[str]]:
+    """Total unique estimated dark lights across active tickets."""
+    cache: dict = {}
+    all_keys: set[str] = set()
+    rows = []
+    if active_df is None or active_df.empty:
+        return 0, [], set()
+    for _, t in active_df.iterrows():
+        td = t.to_dict() if hasattr(t, "to_dict") else dict(t)
+        keys, method = dark_keys_for_ticket(conn, td, cache)
+        all_keys |= keys
+        rows.append(
+            {
+                "Ticket": td.get("id"),
+                "Type": display_ticket_type(td.get("ticket_type")),
+                "Circuit": td.get("circuit_number"),
+                "Location": td.get("light_number") or "",
+                "LUB": td.get("lub") or "",
+                "FUD": td.get("fud") or "",
+                "Est. dark (this call)": len(keys),
+                "How counted": method,
+            }
+        )
+    return len(all_keys), rows, all_keys
+
+
 def page_reports(conn: sqlite3.Connection) -> None:
     st.header("Reports")
     df = tickets_df(conn)
@@ -3145,16 +3290,73 @@ def page_reports(conn: sqlite3.Connection) -> None:
         st.info("No data yet.")
         return
 
-    active = df[df["status"] == "active"]
+    active = df[df["status"] == "active"].copy()
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Active calls", len(active))
     c2.metric("All-time tickets", len(df))
-    c3.metric("Flagged (all time)", int(df["is_flagged"].sum()))
+    c3.metric("Flagged (all time)", int(df["is_flagged"].sum()) if "is_flagged" in df.columns else 0)
     c4.metric("Circuits used", df["circuit_number"].nunique())
+
+    st.subheader("Estimated lights out (active)")
+    st.caption(
+        "Counts unique heads across **all active call types** (Trouble, UGT, theft, knockdown, "
+        "tag outs, etc.). LUB/FUD uses the circuit map: **FUD and everything downstream on that leg**. "
+        "Tag outs count every mapped light on the circuit. Unmapped calls count as 1 each. "
+        "Same light on two tickets is only counted once."
+    )
+    type_opts = ["All"] + list(TICKET_TYPES)
+    # also include any odd stored types
+    if not active.empty and "ticket_type" in active.columns:
+        for t in sorted(active["ticket_type"].dropna().unique()):
+            dt = display_ticket_type(t)
+            if dt not in type_opts:
+                type_opts.append(dt)
+    picked_types = st.multiselect(
+        "Filter by call type",
+        options=[x for x in type_opts if x != "All"],
+        default=[],
+        help="Leave empty to include every active call type.",
+    )
+    filtered_active = active
+    if picked_types and not active.empty:
+        def _type_ok(val) -> bool:
+            return display_ticket_type(val) in picked_types or str(val) in picked_types
+
+        filtered_active = active[active["ticket_type"].map(_type_ok)]
+
+    total_out, detail_rows, _keys = estimate_lights_out(conn, filtered_active)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Est. lights out", total_out)
+    m2.metric("Active calls in filter", len(filtered_active))
+    m3.metric(
+        "Types selected",
+        "All" if not picked_types else len(picked_types),
+    )
+
+    if detail_rows:
+        detail_df = pd.DataFrame(detail_rows)
+        st.dataframe(detail_df, use_container_width=True, hide_index=True)
+        if not filtered_active.empty and "ticket_type" in filtered_active.columns:
+            st.caption("By call type (this filter)")
+            by_type = (
+                detail_df.groupby("Type")["Est. dark (this call)"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+            st.bar_chart(by_type)
+        st.download_button(
+            "Download lights-out estimate (CSV)",
+            detail_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"lights_out_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No active calls match this filter.")
 
     st.subheader("Active by type")
     if not active.empty:
-        st.bar_chart(active["ticket_type"].value_counts())
+        shown = active["ticket_type"].map(display_ticket_type).value_counts()
+        st.bar_chart(shown)
     else:
         st.caption("Nothing active.")
 
@@ -3173,7 +3375,11 @@ def page_reports(conn: sqlite3.Connection) -> None:
     if repeats.empty:
         st.caption("No repeated circuit + light combinations yet.")
     else:
-        st.dataframe(repeats.rename(columns={"circuit_number": "Circuit", "light_number": "Light"}), hide_index=True, use_container_width=True)
+        st.dataframe(
+            repeats.rename(columns={"circuit_number": "Circuit", "light_number": "Location"}),
+            hide_index=True,
+            use_container_width=True,
+        )
 
 
 def main() -> None:
