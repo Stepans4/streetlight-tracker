@@ -508,7 +508,7 @@ def _migrate_lights(conn) -> None:
         pass
 
 
-SIDES = ["", "N", "S", "E", "W"]
+SIDES = ["", "N", "S", "E", "W", "C"]
 DIRS = ["", "N", "S", "E", "W", "@"]
 
 
