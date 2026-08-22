@@ -2966,13 +2966,47 @@ STREET_WORDS = re.compile(
 AND_SPLIT = re.compile(r"\s+(?:and|&|@|at)\s+", re.I)
 
 
+CARDINAL_WORDS = {
+    "N": "N",
+    "S": "S",
+    "E": "E",
+    "W": "W",
+    "NORTH": "N",
+    "SOUTH": "S",
+    "EAST": "E",
+    "WEST": "W",
+}
+
+
+def _cardinal(tok: str) -> str:
+    return CARDINAL_WORDS.get((tok or "").strip().upper(), "")
+
+
+def milwaukee_expected_side(runs: str, house: int | None) -> str:
+    """
+    Milwaukee house numbers:
+      N-S street: even = east, odd = west
+      E-W street: even = north, odd = south
+    """
+    if house is None or not runs:
+        return ""
+    even = house % 2 == 0
+    if runs == "NS":
+        return "E" if even else "W"
+    if runs == "EW":
+        return "N" if even else "S"
+    return ""
+
+
 def parse_address_query(text: str) -> dict:
-    """Pull house number, streets, side, and leftover words from a typed address."""
+    """Pull house #, street prefix (run), expected curb side (Milwaukee), streets."""
     raw = (text or "").strip()
     out = {
         "raw": raw,
         "house": None,
         "side": "",
+        "street_prefix": "",
+        "runs": "",
         "streets": [],
         "tokens": [],
     }
@@ -2990,27 +3024,38 @@ def parse_address_query(text: str) -> dict:
         except ValueError:
             out["house"] = None
 
-    for tok in out["tokens"]:
-        if tok.upper() in {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST"}:
-            letter = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}.get(
-                tok.upper(), tok.upper()[:1]
-            )
-            if letter in {"N", "S", "E", "W"}:
-                out["side"] = letter
-                break
+    # Prefix on the named street: "312 N 1st" or "N 1st St"
+    # That letter is how the *street runs*, not which curb the house sits on.
+    tokens = out["tokens"]
+    prefix = ""
+    for i, tok in enumerate(tokens):
+        c = _cardinal(tok)
+        if not c:
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if nxt and not _cardinal(nxt) and not nxt.isdigit():
+            prefix = c
+            break
+        if not prefix:
+            prefix = c
+    out["street_prefix"] = prefix
+    if prefix in ("N", "S"):
+        out["runs"] = "NS"
+    elif prefix in ("E", "W"):
+        out["runs"] = "EW"
+    out["side"] = milwaukee_expected_side(out["runs"], out["house"])
 
     parts = AND_SPLIT.split(cleaned)
     streets = []
     for part in parts:
         p = STREET_WORDS.sub(" ", part)
         p = re.sub(r"\b\d{1,6}\b", " ", p)
-        p = re.sub(r"\b[nsew]\b", " ", p, flags=re.I)
+        p = re.sub(r"\b(north|south|east|west|[nsew])\b", " ", p, flags=re.I)
         p = re.sub(r"\s+", " ", p).strip(" -")
         if p:
             streets.append(p)
-    # also keep individual leftover words longer than 1 char as street-ish
     if not streets:
-        streets = [t for t in out["tokens"] if t.isalpha() and t.upper() not in {"N", "S", "E", "W"}]
+        streets = [t for t in out["tokens"] if t.isalpha() and not _cardinal(t)]
     out["streets"] = streets
     return out
 
@@ -3056,11 +3101,24 @@ def address_match_score(light: dict, parsed: dict) -> tuple[int, list[str]]:
             score += 20
             reasons.append(f"mentions {street}")
 
-    if parsed.get("side"):
-        side = parsed["side"]
-        if str(light.get("side") or "").upper() == side:
-            score += 8
-            reasons.append(f"side {side}")
+    expected_side = parsed.get("side") or ""
+    light_side = str(light.get("side") or "").upper()
+    if expected_side:
+        if light_side == expected_side:
+            score += 28
+            reasons.append(f"Milwaukee side {expected_side}")
+        elif light_side and light_side != expected_side and light_side != "C":
+            score -= 18
+            reasons.append(f"wrong curb {light_side} (want {expected_side})")
+        elif light_side == "C":
+            score += 6
+            reasons.append("center of street")
+
+    prefix = parsed.get("street_prefix") or ""
+    light_street = str(light.get("street") or "").lower()
+    if prefix and prefix.lower() in light_street.split():
+        score += 6
+        reasons.append(f"street prefix {prefix}")
 
     house = parsed.get("house")
     map_n = _num(light.get("map_number"))
@@ -3083,6 +3141,66 @@ def address_match_score(light: dict, parsed: dict) -> tuple[int, list[str]]:
     if not reasons:
         return 0, []
     return score, reasons
+
+
+def ticket_address_score(ticket: dict, parsed: dict) -> tuple[int, list[str]]:
+    blob = " ".join(
+        str(ticket.get(k) or "")
+        for k in (
+            "circuit_number",
+            "light_number",
+            "map_number",
+            "lub",
+            "fud",
+            "location",
+            "description",
+            "tag_reason",
+        )
+    ).lower()
+    reasons = []
+    score = 0
+    for street in parsed.get("streets") or []:
+        s = street.lower()
+        if len(s) < 2:
+            continue
+        if s in blob:
+            score += 30
+            reasons.append(f"mentions {street}")
+    house = parsed.get("house")
+    if house is not None and str(house) in blob:
+        score += 20
+        reasons.append(f"has {house}")
+    side = parsed.get("side") or ""
+    if side and re.search(rf"\b{side}\b", blob, re.I):
+        score += 10
+        reasons.append(f"side {side}")
+    if not reasons:
+        return 0, []
+    return score, reasons
+
+
+def search_active_tickets_by_address(conn, parsed: dict) -> list[dict]:
+    rows = q_all(
+        conn,
+        """
+        SELECT id, ticket_type, circuit_number, light_number, map_number, lub, fud,
+               location, work_order, created_at, is_tag_out, tag_reason, description
+        FROM tickets
+        WHERE status = 'active'
+        ORDER BY created_at DESC
+        """,
+    )
+    scored = []
+    for t in rows:
+        score, reasons = ticket_address_score(t, parsed)
+        if score <= 0:
+            continue
+        item = dict(t)
+        item["score"] = score
+        item["reasons"] = reasons
+        scored.append(item)
+    scored.sort(key=lambda r: -r["score"])
+    return scored
 
 
 def search_lights_by_address(conn, query: str) -> list[dict]:
@@ -3309,9 +3427,9 @@ def page_light_history(conn) -> None:
 def page_address_search(conn) -> None:
     st.header("Address search")
     st.caption(
-        "Type a house address or intersection. The app looks up **stored lights** "
-        "(street, cross street, Light #, location, notes) and lists likely **circuits**. "
-        "This is a best-guess from your light list — not GPS distance."
+        "Type a house address. **N/S/E/W in front of the street name** is how that street **runs** "
+        "(N 1st = north–south). House number side: N–S street even=east / odd=west; "
+        "E–W street even=north / odd=south. Then it matches mapped lights on that curb and circuit/leg."
     )
     q = st.text_input(
         "Physical address or intersection",
@@ -3326,14 +3444,43 @@ def page_address_search(conn) -> None:
         return
 
     hits, parsed = search_lights_by_address(conn, q)
+    nearby_calls = search_active_tickets_by_address(conn, parsed)
     bits = []
     if parsed.get("house") is not None:
-        bits.append(f"house **{parsed['house']}**")
+        parity = "even" if parsed["house"] % 2 == 0 else "odd"
+        bits.append(f"house **{parsed['house']}** ({parity})")
+    if parsed.get("street_prefix"):
+        run = "north–south" if parsed.get("runs") == "NS" else "east–west" if parsed.get("runs") == "EW" else ""
+        bits.append(f"street prefix **{parsed['street_prefix']}**" + (f" · runs **{run}**" if run else ""))
     if parsed.get("side"):
-        bits.append(f"side **{parsed['side']}**")
+        bits.append(f"expected curb **{parsed['side']}**")
     if parsed.get("streets"):
         bits.append("streets **" + ", ".join(parsed["streets"]) + "**")
     st.caption("Parsed: " + (", ".join(bits) if bits else parsed["raw"]))
+
+    if nearby_calls:
+        st.subheader("Active calls near this address")
+        st.warning(f"**{len(nearby_calls)}** open call(s) mention this street / house / side.")
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Record #": t.get("work_order") or t.get("id"),
+                        "Type": display_ticket_type(t.get("ticket_type")),
+                        "Circuit": t.get("circuit_number"),
+                        "Location": t.get("light_number") or "",
+                        "LUB": t.get("lub") or "",
+                        "FUD": t.get("fud") or "",
+                        "Why": "; ".join(t.get("reasons") or []),
+                    }
+                    for t in nearby_calls
+                ]
+            ),
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No active calls mention this address text.")
 
     if not hits:
         st.warning("No stored lights matched. Add the nearby heads on Circuits & maps, then search again.")
@@ -3342,15 +3489,26 @@ def page_address_search(conn) -> None:
     st.write(f"**{len(hits)}** matching light(s)")
 
     # Circuit summary first
-    by_c: dict[str, int] = {}
+    by_c: dict[str, dict] = {}
     for h in hits:
         cn = h.get("circuit_number") or "?"
-        by_c[cn] = by_c.get(cn, 0) + 1
-    top = sorted(by_c.items(), key=lambda kv: -kv[1])
+        d = by_c.setdefault(cn, {"n": 0, "score": 0, "legs": set()})
+        d["n"] += 1
+        d["score"] = max(d["score"], int(h.get("score") or 0))
+        d["legs"].add(branch_label(h.get("sequence")))
+    top = sorted(by_c.items(), key=lambda kv: (-kv[1]["score"], -kv[1]["n"]))
     st.subheader("Likely circuit(s)")
     st.dataframe(
         pd.DataFrame(
-            [{"Circuit": c, "Matching lights": n} for c, n in top]
+            [
+                {
+                    "Circuit": c,
+                    "Best score": d["score"],
+                    "Matching lights": d["n"],
+                    "Legs": ", ".join(sorted(x for x in d["legs"] if x and x != "—")),
+                }
+                for c, d in top
+            ]
         ),
         hide_index=True,
         use_container_width=True,
@@ -3364,6 +3522,7 @@ def page_address_search(conn) -> None:
                 "Circuit": h.get("circuit_number"),
                 "Location": h.get("light_number"),
                 "Light #": h.get("map_number") or "",
+                "Side": h.get("side") or "",
                 "Seq": h.get("sequence") or "",
                 "Branch": branch_label(h.get("sequence")),
                 "Why": "; ".join(h["reasons"]),
