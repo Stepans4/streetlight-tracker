@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import re
 import sqlite3
 from datetime import datetime, date
 from pathlib import Path
@@ -15,12 +16,36 @@ import pandas as pd
 import streamlit as st
 from pypdf import PdfReader
 
+# Sequence: 1, 1a, 1a2, 2b1 — digits and letters only, must start with a digit.
+SEQ_PATTERN = re.compile(r"^[0-9]+([a-z]+[0-9]*)*$", re.IGNORECASE)
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 PDF_DIR = DATA_DIR / "pdfs"
 DB_PATH = DATA_DIR / "tracker.db"
 
-TICKET_TYPES = ["Outage", "Damage", "Cable Theft", "Pedestal cut", "Other"]
+TICKET_TYPES = [
+    "Outage",
+    "Damage",
+    "Cable Theft",
+    "Pedestal cut",
+    "Knockdown",
+    "Bad fixture",
+    "Bad igniter",
+    "UGT",
+    "Vandalism",
+    "Wire stolen",
+    "Other",
+]
+POLE_MATERIALS = ["", "Aluminum", "Concrete", "Wood", "Steel", "Unknown"]
+CONDITION_FLAGS = [
+    ("knockdown", "Knocked down"),
+    ("bad_fixture", "Bad fixture — replace"),
+    ("bad_igniter", "Bad igniter"),
+    ("ugt", "UGT (underground / that light only)"),
+    ("vandalism", "Vandalized"),
+    ("wire_stolen", "Wire stolen from this light"),
+]
 # Stored values stay short; labels match Milwaukee DPW language.
 CIRCUIT_TYPE_LABELS = {
     "series": "Series (legacy constant-current)",
@@ -44,12 +69,44 @@ SCHEMA_STATEMENTS = [
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         circuit_id INTEGER NOT NULL,
         light_number TEXT NOT NULL,
-        sequence INTEGER,
+        map_number TEXT,
+        street TEXT,
+        side TEXT,
+        nth INTEGER,
+        from_dir TEXT,
+        cross_street TEXT,
+        sequence TEXT,
         location_note TEXT,
+        pole_material TEXT,
+        pole_height TEXT,
+        fixture_type TEXT,
         UNIQUE(circuit_id, light_number),
         FOREIGN KEY (circuit_id) REFERENCES circuits(id) ON DELETE CASCADE
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS light_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        circuit_number TEXT NOT NULL,
+        light_number TEXT NOT NULL,
+        map_number TEXT,
+        ticket_id INTEGER,
+        event_type TEXT NOT NULL,
+        knockdown INTEGER NOT NULL DEFAULT 0,
+        bad_fixture INTEGER NOT NULL DEFAULT 0,
+        bad_igniter INTEGER NOT NULL DEFAULT 0,
+        ugt INTEGER NOT NULL DEFAULT 0,
+        vandalism INTEGER NOT NULL DEFAULT 0,
+        wire_stolen INTEGER NOT NULL DEFAULT 0,
+        pole_material TEXT,
+        pole_height TEXT,
+        fixture_type TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_light_events_light ON light_events(circuit_number, light_number)",
+    "CREATE INDEX IF NOT EXISTS idx_light_events_map ON light_events(map_number)",
     """
     CREATE TABLE IF NOT EXISTS circuit_pdfs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -67,6 +124,7 @@ SCHEMA_STATEMENTS = [
         ticket_type TEXT NOT NULL,
         circuit_number TEXT NOT NULL,
         light_number TEXT,
+        map_number TEXT,
         lub TEXT,
         fud TEXT,
         pedestal_cut INTEGER NOT NULL DEFAULT 0,
@@ -265,31 +323,114 @@ def init_db() -> None:
         _run_sql(conn, stmt)
     conn.commit()
     _migrate_tickets(conn)
+    _migrate_lights(conn)
     conn.close()
+
+
+def _pragma_cols(conn, table: str) -> set[str]:
+    cols = set()
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        for row in rows:
+            cols.add(row[1] if not isinstance(row, dict) else row.get("name") or row.get("name", row[1]))
+    except Exception:
+        pass
+    # Turso may not support PRAGMA the same way; ignore
+    clean = set()
+    for c in cols:
+        if isinstance(c, str):
+            clean.add(c)
+    return clean
 
 
 def _migrate_tickets(conn) -> None:
     try:
-        rows = conn.execute("PRAGMA table_info(tickets)").fetchall()
-        cols = set()
-        for row in rows:
-            # Row may be tuple or sqlite3.Row
-            if isinstance(row, sqlite3.Row):
-                cols.add(row[1])
-            else:
-                cols.add(row[1])
-        if "lub" not in cols:
-            conn.execute("ALTER TABLE tickets ADD COLUMN lub TEXT")
-        if "fud" not in cols:
-            conn.execute("ALTER TABLE tickets ADD COLUMN fud TEXT")
-        if "pedestal_cut" not in cols:
-            conn.execute(
-                "ALTER TABLE tickets ADD COLUMN pedestal_cut INTEGER NOT NULL DEFAULT 0"
-            )
+        cols = _pragma_cols(conn, "tickets")
+        adds = {
+            "lub": "ALTER TABLE tickets ADD COLUMN lub TEXT",
+            "fud": "ALTER TABLE tickets ADD COLUMN fud TEXT",
+            "pedestal_cut": "ALTER TABLE tickets ADD COLUMN pedestal_cut INTEGER NOT NULL DEFAULT 0",
+            "map_number": "ALTER TABLE tickets ADD COLUMN map_number TEXT",
+        }
+        for name, sql in adds.items():
+            if name not in cols:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
         conn.commit()
     except Exception:
-        # Fresh Turso DB already has columns from CREATE TABLE
         pass
+
+
+def _migrate_lights(conn) -> None:
+    try:
+        cols = _pragma_cols(conn, "circuit_lights")
+        adds = {
+            "map_number": "ALTER TABLE circuit_lights ADD COLUMN map_number TEXT",
+            "street": "ALTER TABLE circuit_lights ADD COLUMN street TEXT",
+            "side": "ALTER TABLE circuit_lights ADD COLUMN side TEXT",
+            "nth": "ALTER TABLE circuit_lights ADD COLUMN nth INTEGER",
+            "from_dir": "ALTER TABLE circuit_lights ADD COLUMN from_dir TEXT",
+            "cross_street": "ALTER TABLE circuit_lights ADD COLUMN cross_street TEXT",
+            "pole_material": "ALTER TABLE circuit_lights ADD COLUMN pole_material TEXT",
+            "pole_height": "ALTER TABLE circuit_lights ADD COLUMN pole_height TEXT",
+            "fixture_type": "ALTER TABLE circuit_lights ADD COLUMN fixture_type TEXT",
+        }
+        for name, sql in adds.items():
+            if name not in cols:
+                try:
+                    conn.execute(sql)
+                except Exception:
+                    pass
+        conn.commit()
+    except Exception:
+        pass
+
+
+SIDES = ["", "N", "S", "E", "W"]
+DIRS = ["", "N", "S", "E", "W"]
+
+
+def format_callout(street: str, side: str, nth, from_dir: str, cross: str) -> str:
+    """1 W 1 N Mason -> 1W-1N-Mason"""
+    street = (street or "").strip()
+    side = (side or "").strip().upper()
+    from_dir = (from_dir or "").strip().upper()
+    cross = (cross or "").strip()
+    nth_s = str(nth).strip() if nth not in (None, "") else ""
+    if not street:
+        return ""
+    parts = [street.replace(" ", "")]
+    if side:
+        parts[0] = parts[0] + side
+    mid = ""
+    if nth_s:
+        mid += nth_s
+    if from_dir:
+        mid += from_dir
+    bits = [parts[0]]
+    if mid:
+        bits.append(mid)
+    if cross:
+        bits.append(cross.replace(" ", "-"))
+    return "-".join(bits)
+
+
+def spoken_callout(street: str, side: str, nth, from_dir: str, cross: str) -> str:
+    """1 W 1 N Mason"""
+    bits = []
+    if street:
+        bits.append(str(street).strip())
+    if side:
+        bits.append(str(side).strip().upper())
+    if nth not in (None, ""):
+        bits.append(str(nth).strip())
+    if from_dir:
+        bits.append(str(from_dir).strip().upper())
+    if cross:
+        bits.append(str(cross).strip())
+    return " ".join(bits)
 
 
 def now_iso() -> str:
@@ -331,7 +472,217 @@ def get_or_create_circuit(
     return created or {"circuit_number": circuit_number.strip(), "id": None}
 
 
-def get_light_sequence(conn, circuit_number: str, light_number: str) -> int | None:
+def normalize_seq(value: str | int | None) -> str:
+    return str(value or "").strip().lower().replace(" ", "").replace("-", "")
+
+
+def is_valid_sequence(value: str | int | None) -> bool:
+    """Regex validation: 1, 1a, 1a2, 2b1 — no symbols or leading letters."""
+    s = normalize_seq(value)
+    if not s:
+        return True  # empty allowed (optional field)
+    return bool(SEQ_PATTERN.fullmatch(s))
+
+
+def validate_sequence_or_error(value: str | int | None) -> str | None:
+    """Return error message or None if OK."""
+    s = str(value or "").strip()
+    if not s:
+        return None
+    if is_valid_sequence(s):
+        return None
+    return (
+        f"Invalid sequence '{s}'. Use forms like 1, 1a, 1b, 1a1, 1a2 "
+        "(digits and letters only, must start with a number)."
+    )
+
+
+def seq_tokens(value: str | int | None) -> list:
+    """Turn 1a2 into [1, 'a', 2] so branches compare correctly."""
+    s = normalize_seq(value)
+    if not s:
+        return []
+    tokens: list = []
+    i = 0
+    while i < len(s):
+        if s[i].isdigit():
+            j = i
+            while j < len(s) and s[j].isdigit():
+                j += 1
+            tokens.append(int(s[i:j]))
+            i = j
+        elif s[i].isalpha():
+            j = i
+            while j < len(s) and s[j].isalpha():
+                j += 1
+            tokens.append(s[i:j])
+            i = j
+        else:
+            i += 1
+    return tokens
+
+
+def seq_sort_key(value: str | int | None) -> tuple:
+    parts = []
+    for t in seq_tokens(value):
+        if isinstance(t, int):
+            parts.append((0, t, ""))
+        else:
+            parts.append((1, 0, t))
+    return tuple(parts)
+
+
+def branch_label(value: str | int | None) -> str:
+    """Visual branch indicator from sequence (1a2 → A leg, 1 → Main / feed)."""
+    tokens = seq_tokens(value)
+    if not tokens:
+        return "—"
+    for t in tokens:
+        if isinstance(t, str) and t:
+            letter = t[0].upper()
+            return f"{letter} leg"
+    return "Main / feed"
+
+
+def branch_depth(value: str | int | None) -> int:
+    """How deep in the tree (number of letter segments)."""
+    return sum(1 for t in seq_tokens(value) if isinstance(t, str))
+
+
+def format_sequence_tree(lights: list[dict]) -> str:
+    """
+    Hierarchical tree view of lights by sequence.
+    Example:
+      1 — #12  [Main / feed]
+      ├── 1a — #18  [A leg]
+      │   └── 1a1 — #19  [A leg]
+      └── 1b — #21  [B leg]
+    """
+    if not lights:
+        return "(no lights)"
+
+    items = []
+    for r in lights:
+        seq = normalize_seq(r.get("sequence"))
+        if not seq:
+            continue
+        toks = seq_tokens(seq)
+        items.append(
+            {
+                "seq": seq,
+                "tokens": toks,
+                "depth": max(0, len(toks) - 1),
+                "light": r.get("light_number") or "?",
+                "loc": (r.get("location_note") or "").strip(),
+                "branch": branch_label(seq),
+            }
+        )
+    items.sort(key=lambda x: seq_sort_key(x["seq"]))
+
+    def has_later_sibling(idx: int, depth: int) -> bool:
+        cur = items[idx]["tokens"]
+        parent = cur[:depth]
+        for j in range(idx + 1, len(items)):
+            ot = items[j]["tokens"]
+            if len(ot) <= depth:
+                if ot[:depth] != parent and len(ot) < depth + 1:
+                    return False
+                if len(ot) < depth:
+                    return False
+            if ot[:depth] != parent:
+                return False
+            if len(ot) > depth and ot[:depth] == parent:
+                # another node under same parent
+                if ot[: depth + 1] != cur[: depth + 1]:
+                    return True
+        return False
+
+    def is_last_child(idx: int) -> bool:
+        cur = items[idx]["tokens"]
+        depth = items[idx]["depth"]
+        if depth == 0:
+            return True
+        parent = cur[:depth]
+        for j in range(idx + 1, len(items)):
+            ot = items[j]["tokens"]
+            if len(ot) < depth:
+                return True
+            if ot[:depth] != parent:
+                return True
+            if len(ot) == depth + 0:  # pragma: no cover
+                pass
+            if len(ot) >= depth and ot[:depth] == parent:
+                # peer or descendant of peer
+                if len(ot) >= depth + 1 and ot[:depth] == parent and ot[: depth + 1] != cur[: depth + 1]:
+                    return False
+                if len(ot) == len(cur) and ot[:depth] == parent and ot != cur:
+                    return False
+        return True
+
+    lines: list[str] = []
+    for i, item in enumerate(items):
+        depth = item["depth"]
+        if depth == 0:
+            prefix = ""
+        else:
+            parts = []
+            for d in range(1, depth):
+                parts.append("│   " if has_later_sibling(i, d) else "    ")
+            parts.append("└── " if is_last_child(i) else "├── ")
+            prefix = "".join(parts)
+
+        loc_bit = f" — {item['loc']}" if item["loc"] else ""
+        lines.append(
+            f"{prefix}{item['seq']} — #{item['light']}  [{item['branch']}]{loc_bit}"
+        )
+
+    # Unsequenced lights at the end
+    orphan = [
+        r
+        for r in lights
+        if not normalize_seq(r.get("sequence"))
+    ]
+    for r in orphan:
+        loc = (r.get("location_note") or "").strip()
+        loc_bit = f" — {loc}" if loc else ""
+        lines.append(f"(no seq) — #{r.get('light_number') or '?'}  [—]{loc_bit}")
+
+    return "\n".join(lines)
+
+
+def same_branch_at_or_after(newer, older) -> bool:
+    """True if newer is on older's branch at or past older (1a2 after 1a, not after 1b)."""
+    a = seq_tokens(older)
+    b = seq_tokens(newer)
+    if not a or not b:
+        return False
+    if b == a:
+        return True
+    return len(b) > len(a) and b[: len(a)] == a
+
+
+def same_branch_after(newer, older) -> bool:
+    a = seq_tokens(older)
+    b = seq_tokens(newer)
+    if not a or not b:
+        return False
+    return len(b) > len(a) and b[: len(a)] == a
+
+
+def ranges_overlap_same_branch(new_lub, new_fud, old_lub, old_fud) -> bool:
+    """Overlap only if both ranges sit on a shared branch prefix."""
+    pairs = [
+        (new_lub, old_lub),
+        (new_lub, old_fud),
+        (new_fud, old_lub),
+        (new_fud, old_fud),
+    ]
+    return any(
+        same_branch_at_or_after(x, y) or same_branch_at_or_after(y, x) for x, y in pairs
+    )
+
+
+def get_light_sequence(conn, circuit_number: str, light_number: str) -> str | None:
     row = q_one(
         conn,
         """
@@ -342,8 +693,8 @@ def get_light_sequence(conn, circuit_number: str, light_number: str) -> int | No
         """,
         (circuit_number.strip(), str(light_number).strip()),
     )
-    if row and row.get("sequence") is not None:
-        return int(row["sequence"])
+    if row and row.get("sequence") not in (None, ""):
+        return normalize_seq(row["sequence"])
     return None
 
 
@@ -410,14 +761,16 @@ def check_duplicate(
 
         if new_seqs and (dark_from is not None or break_after is not None):
             for ns in new_seqs:
-                after_lub = break_after is not None and ns > break_after
-                at_or_after_fud = dark_from is not None and ns >= dark_from
+                after_lub = break_after is not None and same_branch_after(ns, break_after)
+                at_or_after_fud = dark_from is not None and same_branch_at_or_after(
+                    ns, dark_from
+                )
                 if after_lub or at_or_after_fud:
                     reason = (
-                        f"Same break as ticket #{t.get('id')} — new unit is at/after "
-                        f"LUB {t.get('lub') or '—'} / FUD {t.get('fud') or t.get('light_number') or '—'}. "
-                        f"Break is between last unit burning and first unit dark "
-                        f"(series run or wires cut in a pedestal)."
+                        f"Same break as ticket #{t.get('id')} — new unit is on the same "
+                        f"leg at/after LUB {t.get('lub') or '—'} / FUD "
+                        f"{t.get('fud') or t.get('light_number') or '—'}. "
+                        f"Other legs (e.g. 1b vs 1a) are not treated as downstream."
                     )
                     return True, reason, t.get("id")
 
@@ -428,14 +781,13 @@ def check_duplicate(
             and new_fud_seq is not None
             and t_lub_seq is not None
             and t_fud_seq is not None
+            and ranges_overlap_same_branch(new_lub_seq, new_fud_seq, t_lub_seq, t_fud_seq)
         ):
-            overlap = not (new_fud_seq < t_lub_seq or new_lub_seq > t_fud_seq)
-            if overlap:
-                reason = (
-                    f"LUB/FUD range overlaps ticket #{t.get('id')} "
-                    f"(existing LUB {t.get('lub')} / FUD {t.get('fud')})."
-                )
-                return True, reason, t.get("id")
+            reason = (
+                f"LUB/FUD range overlaps ticket #{t.get('id')} on the same leg "
+                f"(existing LUB {t.get('lub')} / FUD {t.get('fud')})."
+            )
+            return True, reason, t.get("id")
 
     ids = ", ".join(f"#{t.get('id')}" for t in active)
     summary = "; ".join(
@@ -464,20 +816,22 @@ def insert_ticket(
     lub: str = "",
     fud: str = "",
     pedestal_cut: bool = False,
+    map_number: str = "",
 ) -> tuple[int, bool, str]:
     flagged, reason, parent = check_duplicate(conn, circuit_number, light_number, lub, fud)
     cur = conn.execute(
         """
         INSERT INTO tickets (
-            ticket_type, circuit_number, light_number, lub, fud, pedestal_cut,
+            ticket_type, circuit_number, light_number, map_number, lub, fud, pedestal_cut,
             location, description,
             status, is_flagged, flag_reason, parent_ticket_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
         """,
         (
             ticket_type,
             circuit_number.strip(),
             _norm(light_number) or None,
+            _norm(map_number) or None,
             _norm(lub) or None,
             _norm(fud) or None,
             1 if pedestal_cut else 0,
@@ -490,7 +844,75 @@ def insert_ticket(
         ),
     )
     conn.commit()
-    return cur.lastrowid, flagged, reason
+    tid = cur.lastrowid
+    return tid, flagged, reason
+
+
+def log_light_event(
+    conn,
+    circuit_number: str,
+    light_number: str,
+    map_number: str = "",
+    ticket_id: int | None = None,
+    event_type: str = "update",
+    flags: dict | None = None,
+    pole_material: str = "",
+    pole_height: str = "",
+    fixture_type: str = "",
+    notes: str = "",
+) -> None:
+    flags = flags or {}
+    if not _norm(circuit_number) or not _norm(light_number):
+        return
+    conn.execute(
+        """
+        INSERT INTO light_events (
+            circuit_number, light_number, map_number, ticket_id, event_type,
+            knockdown, bad_fixture, bad_igniter, ugt, vandalism, wire_stolen,
+            pole_material, pole_height, fixture_type, notes, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            circuit_number.strip(),
+            _norm(light_number),
+            _norm(map_number) or None,
+            ticket_id,
+            event_type,
+            1 if flags.get("knockdown") else 0,
+            1 if flags.get("bad_fixture") else 0,
+            1 if flags.get("bad_igniter") else 0,
+            1 if flags.get("ugt") else 0,
+            1 if flags.get("vandalism") else 0,
+            1 if flags.get("wire_stolen") else 0,
+            _norm(pole_material) or None,
+            _norm(pole_height) or None,
+            _norm(fixture_type) or None,
+            _norm(notes) or None,
+            now_iso(),
+        ),
+    )
+    circ = get_circuit(conn, circuit_number)
+    if circ and circ.get("id") and (pole_material or pole_height or fixture_type or map_number):
+        conn.execute(
+            """
+            UPDATE circuit_lights
+            SET
+                map_number = COALESCE(?, map_number),
+                pole_material = COALESCE(?, pole_material),
+                pole_height = COALESCE(?, pole_height),
+                fixture_type = COALESCE(?, fixture_type)
+            WHERE circuit_id = ? AND light_number = ?
+            """,
+            (
+                _norm(map_number) or None,
+                _norm(pole_material) or None,
+                _norm(pole_height) or None,
+                _norm(fixture_type) or None,
+                circ.get("id"),
+                _norm(light_number),
+            ),
+        )
+    conn.commit()
 
 
 def complete_ticket(conn: sqlite3.Connection, ticket_id: int, notes: str) -> None:
@@ -548,6 +970,7 @@ def filter_tickets(
     if light:
         hit = (
             out["light_number"].astype(str).str.contains(light, case=False, na=False)
+            | out.get("map_number", pd.Series("", index=out.index)).astype(str).str.contains(light, case=False, na=False)
             | out.get("lub", pd.Series("", index=out.index)).astype(str).str.contains(light, case=False, na=False)
             | out.get("fud", pd.Series("", index=out.index)).astype(str).str.contains(light, case=False, na=False)
         )
@@ -559,6 +982,8 @@ def filter_tickets(
             out["circuit_number"].astype(str)
             + " "
             + out["light_number"].fillna("").astype(str)
+            + " "
+            + out.get("map_number", pd.Series("", index=out.index)).fillna("").astype(str)
             + " "
             + out.get("lub", pd.Series("", index=out.index)).fillna("").astype(str)
             + " "
@@ -595,31 +1020,95 @@ def page_new_call(conn: sqlite3.Connection) -> None:
     with st.form("new_call", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
         ticket_type = c1.selectbox("Type", TICKET_TYPES)
-        circuit_number = c2.text_input("Circuit number *", placeholder="e.g. 1427")
-        light_number = c3.text_input("Reported light #", placeholder="from the call")
+        circuit_number = c2.text_input("Circuit number *", placeholder="e.g. T1S-A")
+        map_number = c3.text_input("Map / plate #", placeholder="305 (can repeat on other streets)")
+        st.caption(
+            "Identify the **head** by street callout, not plate # alone. "
+            "Example: west side of 1st, first light north of Mason → **1 W 1 N Mason** (`1W-1N-Mason`)."
+        )
+        a1, a2, a3, a4, a5 = st.columns(5)
+        street = a1.text_input("Street", placeholder="1 or 1st")
+        side = a2.selectbox("Side of street", SIDES)
+        nth = a3.number_input("Nth light from cross", min_value=0, step=1, value=0)
+        from_dir = a4.selectbox("Direction from cross", DIRS)
+        cross = a5.text_input("Cross street", placeholder="Mason")
+        callout_override = st.text_input(
+            "Callout (optional if you filled the boxes)",
+            placeholder="1W-1N-Mason or 1 W 1 N Mason",
+        )
         l1, l2, l3 = st.columns(3)
-        lub = l1.text_input("LUB — last unit burning", placeholder="last light still on")
-        fud = l2.text_input("FUD — first unit dark", placeholder="first light out")
+        lub = l1.text_input("LUB — last unit burning", placeholder="1W-1N-Mason")
+        fud = l2.text_input("FUD — first unit dark", placeholder="1W-2N-Mason")
         pedestal_cut = l3.checkbox("Wires cut in pedestal")
-        location = st.text_input("Location / intersection", placeholder="N 27th & W Capitol")
-        description = st.text_area("Notes", placeholder="LUB 12 / FUD 13. Pedestal between them cut.")
+        location = st.text_input("Location / intersection", placeholder="1st & Mason")
+        st.markdown("**Condition of this light**")
+        f1, f2, f3 = st.columns(3)
+        knockdown = f1.checkbox("Knocked down")
+        bad_fixture = f2.checkbox("Bad fixture — replace")
+        bad_igniter = f3.checkbox("Bad igniter")
+        f4, f5, f6 = st.columns(3)
+        ugt = f4.checkbox("UGT (this light only)")
+        vandalism = f5.checkbox("Vandalized")
+        wire_stolen = f6.checkbox("Wire stolen from this light")
+        p1, p2, p3 = st.columns(3)
+        pole_material = p1.selectbox("Pole type", POLE_MATERIALS)
+        pole_height = p2.text_input("Pole height", placeholder="e.g. 30 ft")
+        fixture_type = p3.text_input("Fixture type", placeholder="e.g. LED cobra / acorn")
+        description = st.text_area("Notes", placeholder="LUB / FUD. Pedestal between them cut.")
         submitted = st.form_submit_button("Log call", type="primary")
 
     if submitted:
         if not circuit_number.strip():
             st.error("Circuit number is required.")
             return
+        built = format_callout(street, side, nth if nth else "", from_dir, cross)
+        spoken = spoken_callout(street, side, nth if nth else "", from_dir, cross)
+        light_id = (callout_override or "").strip() or built or (map_number or "").strip()
+        loc = location.strip() or spoken
         get_or_create_circuit(conn, circuit_number)
+        flags = {
+            "knockdown": knockdown or ticket_type == "Knockdown",
+            "bad_fixture": bad_fixture or ticket_type == "Bad fixture",
+            "bad_igniter": bad_igniter or ticket_type == "Bad igniter",
+            "ugt": ugt or ticket_type == "UGT",
+            "vandalism": vandalism or ticket_type == "Vandalism",
+            "wire_stolen": wire_stolen or ticket_type == "Wire stolen",
+        }
+        extra = []
+        for key, label in CONDITION_FLAGS:
+            if flags.get(key):
+                extra.append(label)
+        if pole_material:
+            extra.append(f"pole {pole_material} {pole_height}".strip())
+        if fixture_type:
+            extra.append(f"fixture {fixture_type}")
+        desc = description
+        if extra:
+            desc = ((description or "").strip() + "\n" + "; ".join(extra)).strip()
         tid, flagged, reason = insert_ticket(
             conn,
             ticket_type,
             circuit_number,
-            light_number,
-            location,
-            description,
+            light_id,
+            loc,
+            desc,
             lub=lub,
             fud=fud,
             pedestal_cut=pedestal_cut or ticket_type == "Pedestal cut",
+            map_number=map_number,
+        )
+        log_light_event(
+            conn,
+            circuit_number,
+            light_id,
+            map_number=map_number,
+            ticket_id=tid,
+            event_type=ticket_type,
+            flags=flags,
+            pole_material=pole_material,
+            pole_height=pole_height,
+            fixture_type=fixture_type,
+            notes=desc,
         )
         if flagged:
             st.warning(f"Ticket #{tid} logged but **flagged**.\n\n{reason}")
@@ -655,6 +1144,7 @@ def page_active(conn: sqlite3.Connection) -> None:
         "ticket_type",
         "circuit_number",
         "light_number",
+        "map_number",
         "lub",
         "fud",
         "pedestal_cut",
@@ -670,7 +1160,8 @@ def page_active(conn: sqlite3.Connection) -> None:
             "created_at": "Logged",
             "ticket_type": "Type",
             "circuit_number": "Circuit",
-            "light_number": "Reported",
+            "light_number": "Callout",
+            "map_number": "Map #",
             "lub": "LUB",
             "fud": "FUD",
             "pedestal_cut": "Pedestal cut",
@@ -732,6 +1223,7 @@ def page_history(conn: sqlite3.Connection) -> None:
         "ticket_type",
         "circuit_number",
         "light_number",
+        "map_number",
         "lub",
         "fud",
         "pedestal_cut",
@@ -748,7 +1240,8 @@ def page_history(conn: sqlite3.Connection) -> None:
             "completed_at": "Completed",
             "ticket_type": "Type",
             "circuit_number": "Circuit",
-            "light_number": "Reported",
+            "light_number": "Callout",
+            "map_number": "Map #",
             "lub": "LUB",
             "fud": "FUD",
             "pedestal_cut": "Pedestal cut",
@@ -778,9 +1271,9 @@ def page_history(conn: sqlite3.Connection) -> None:
 def page_circuits(conn: sqlite3.Connection) -> None:
     st.header("Circuits & maps")
     st.caption(
-        "Upload circuit PDFs and (optionally) enter the light order from the source. "
-        "Light order is used with **LUB / FUD** to find the same break on series runs "
-        "and on parallel LED circuits where wires are cut in a pedestal."
+        "Upload circuit PDFs and enter light order from the source. "
+        "Sequences can be nested (`1`, `1a`, `1a1`, `1b`) so parallel legs stay separate. "
+        "Same-leg downstream only is flagged as the same break."
     )
 
     tab_list, tab_add, tab_import, tab_pdf = st.tabs(
@@ -821,23 +1314,49 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             lights = q_all(
                 conn,
                 """
-                SELECT cl.sequence, cl.light_number, cl.location_note
+                SELECT cl.sequence, cl.light_number, cl.map_number, cl.street, cl.side,
+                       cl.nth, cl.from_dir, cl.cross_street, cl.location_note,
+                       cl.pole_material, cl.pole_height, cl.fixture_type
                 FROM circuit_lights cl
                 JOIN circuits c ON c.id = cl.circuit_id
                 WHERE c.circuit_number = ?
-                ORDER BY COALESCE(cl.sequence, 999999), cl.light_number
                 """,
                 (pick,),
             )
+            lights = sorted(
+                lights,
+                key=lambda r: (seq_sort_key(r.get("sequence")), str(r.get("light_number") or "")),
+            )
             if lights:
-                st.dataframe(
-                    pd.DataFrame(lights).rename(
-                        columns={
-                            "sequence": "Seq (from source)",
-                            "light_number": "Light #",
-                            "location_note": "Location",
+                st.subheader("Branch tree")
+                st.code(format_sequence_tree(lights), language=None)
+
+                table_rows = []
+                for r in lights:
+                    seq = r.get("sequence")
+                    table_rows.append(
+                        {
+                            "Seq": seq or "—",
+                            "Branch": branch_label(seq),
+                            "Callout": r.get("light_number"),
+                            "Map #": r.get("map_number") or "",
+                            "Spoken": spoken_callout(
+                                r.get("street") or "",
+                                r.get("side") or "",
+                                r.get("nth"),
+                                r.get("from_dir") or "",
+                                r.get("cross_street") or "",
+                            ),
+                            "Location": r.get("location_note") or "",
+                            "Pole": " ".join(
+                                x for x in (r.get("pole_material"), r.get("pole_height")) if x
+                            ),
+                            "Fixture": r.get("fixture_type") or "",
                         }
-                    ),
+                    )
+                st.subheader("Light list")
+                st.dataframe(
+                    pd.DataFrame(table_rows),
                     use_container_width=True,
                     hide_index=True,
                 )
@@ -925,64 +1444,169 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             st.rerun()
 
         st.subheader("Add a single light to the sequence")
+        st.caption(
+            "Unique ID is the **callout** (1W-1N-Mason), not map #305. "
+            "Sequence: `1`, `1a`, `1a1`, `1b`."
+        )
         with st.form("add_light"):
             cn2 = st.text_input("Circuit number", key="al_cn")
-            ln = st.text_input("Light number")
-            seq = st.number_input("Sequence from source (1 = first / upstream)", min_value=1, step=1)
+            map_n = st.text_input("Map / plate #", placeholder="305")
+            b1, b2, b3, b4, b5 = st.columns(5)
+            st_street = b1.text_input("Street", placeholder="1")
+            st_side = b2.selectbox("Side", SIDES, key="al_side")
+            st_nth = b3.number_input("Nth from cross", min_value=0, step=1, value=0, key="al_nth")
+            st_dir = b4.selectbox("Dir from cross", DIRS, key="al_dir")
+            st_cross = b5.text_input("Cross street", placeholder="Mason")
+            ln = st.text_input("Callout override (optional)", placeholder="leave blank to auto-build 1W-1N-Mason")
+            seq = st.text_input(
+                "Sequence from source",
+                placeholder="1   or  1a   or  1a2",
+                help="Use 1, 1a, 1b, 1a1, 1a2 for splits. Same-leg only is treated as downstream.",
+            )
             loc = st.text_input("Location note")
+            p1, p2, p3 = st.columns(3)
+            pole_material = p1.selectbox("Pole type", POLE_MATERIALS, key="al_pole")
+            pole_height = p2.text_input("Pole height", placeholder="30 ft", key="al_ht")
+            fixture_type = p3.text_input("Fixture type", placeholder="LED cobra", key="al_fx")
             add_l = st.form_submit_button("Add light")
-        if add_l and cn2.strip() and ln.strip():
-            circ = get_or_create_circuit(conn, cn2)
-            try:
-                conn.execute(
-                    """
-                    INSERT INTO circuit_lights (circuit_id, light_number, sequence, location_note)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(circuit_id, light_number) DO UPDATE SET
-                        sequence = excluded.sequence,
-                        location_note = excluded.location_note
-                    """,
-                    (circ.get("id"), ln.strip(), int(seq), loc.strip() or None),
-                )
-                conn.commit()
-                st.success(f"Light {ln.strip()} on circuit {cn2.strip()} saved at sequence {int(seq)}.")
-            except sqlite3.Error as e:
-                st.error(str(e))
+        if add_l and cn2.strip():
+            built = format_callout(st_street, st_side, st_nth if st_nth else "", st_dir, st_cross)
+            callout = (ln or "").strip() or built
+            if not callout:
+                st.error("Enter a callout or street + side + cross so two #305s stay distinct.")
+            else:
+                err = validate_sequence_or_error(seq)
+                if err:
+                    st.error(err)
+                else:
+                    circ = get_or_create_circuit(conn, cn2)
+                    seq_val = normalize_seq(seq) or None
+                    br = branch_label(seq_val) if seq_val else "—"
+                    nth_val = int(st_nth) if st_nth else None
+                    try:
+                        conn.execute(
+                            """
+                            INSERT INTO circuit_lights (
+                                circuit_id, light_number, map_number, street, side, nth,
+                                from_dir, cross_street, sequence, location_note,
+                                pole_material, pole_height, fixture_type
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ON CONFLICT(circuit_id, light_number) DO UPDATE SET
+                                map_number = excluded.map_number,
+                                street = excluded.street,
+                                side = excluded.side,
+                                nth = excluded.nth,
+                                from_dir = excluded.from_dir,
+                                cross_street = excluded.cross_street,
+                                sequence = excluded.sequence,
+                                location_note = excluded.location_note,
+                                pole_material = excluded.pole_material,
+                                pole_height = excluded.pole_height,
+                                fixture_type = excluded.fixture_type
+                            """,
+                            (
+                                circ.get("id"),
+                                callout,
+                                (map_n or "").strip() or None,
+                                (st_street or "").strip() or None,
+                                (st_side or "").strip() or None,
+                                nth_val,
+                                (st_dir or "").strip() or None,
+                                (st_cross or "").strip() or None,
+                                seq_val,
+                                loc.strip() or spoken_callout(st_street, st_side, nth_val, st_dir, st_cross) or None,
+                                (pole_material or "").strip() or None,
+                                (pole_height or "").strip() or None,
+                                (fixture_type or "").strip() or None,
+                            ),
+                        )
+                        conn.commit()
+                        st.success(
+                            f"Saved **{callout}** (map #{map_n or '—'}) on {cn2.strip()} "
+                            f"at **{seq_val or '(none)'}** [{br}]."
+                        )
+                    except sqlite3.Error as e:
+                        st.error(str(e))
 
     with tab_import:
-        st.write("CSV columns: `circuit_number,light_number,sequence,location`")
-        st.code("1427,1,1,N 27th & Capitol\n1427,2,2,N 27th mid-block\n1427,3,3,N 27th & Keefe", language="csv")
+        st.write(
+            "CSV columns: `circuit_number,light_number,sequence,location` "
+            "plus optional `map_number,street,side,nth,from_dir,cross_street`."
+        )
+        st.code(
+            "circuit_number,light_number,map_number,street,side,nth,from_dir,cross_street,sequence,location\n"
+            "T1S-A,1W-1N-Mason,305,1,W,1,N,Mason,1a,W side 1st N of Mason\n"
+            "T1S-A,2W-1N-Mason,305,2,W,1,N,Mason,1b,W side 2nd N of Mason",
+            language="csv",
+        )
         up = st.file_uploader("CSV file", type=["csv"])
         if up and st.button("Import CSV"):
             text = up.getvalue().decode("utf-8-sig")
             reader = csv.DictReader(io.StringIO(text))
-            needed = {"circuit_number", "light_number"}
+            needed = {"circuit_number"}
             if not reader.fieldnames or not needed.issubset({f.strip() for f in reader.fieldnames}):
-                st.error("CSV must include circuit_number and light_number columns.")
+                st.error("CSV must include circuit_number.")
             else:
                 n = 0
+                skipped = []
                 for row in reader:
                     cn = (row.get("circuit_number") or "").strip()
-                    ln = (row.get("light_number") or "").strip()
+                    built = format_callout(
+                        row.get("street") or "",
+                        row.get("side") or "",
+                        row.get("nth") or "",
+                        row.get("from_dir") or "",
+                        row.get("cross_street") or "",
+                    )
+                    ln = (row.get("light_number") or "").strip() or built
                     if not cn or not ln:
                         continue
-                    circ = get_or_create_circuit(conn, cn)
                     seq_raw = (row.get("sequence") or "").strip()
-                    seq = int(seq_raw) if seq_raw.isdigit() else None
+                    err = validate_sequence_or_error(seq_raw)
+                    if err:
+                        skipped.append(f"{cn}/{ln}: {err}")
+                        continue
+                    circ = get_or_create_circuit(conn, cn)
+                    seq = normalize_seq(seq_raw) or None
                     loc = (row.get("location") or "").strip() or None
+                    nth_raw = (row.get("nth") or "").strip()
+                    nth_val = int(nth_raw) if nth_raw.isdigit() else None
                     conn.execute(
                         """
-                        INSERT INTO circuit_lights (circuit_id, light_number, sequence, location_note)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO circuit_lights (
+                            circuit_id, light_number, map_number, street, side, nth,
+                            from_dir, cross_street, sequence, location_note
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(circuit_id, light_number) DO UPDATE SET
+                            map_number = COALESCE(excluded.map_number, circuit_lights.map_number),
+                            street = COALESCE(excluded.street, circuit_lights.street),
+                            side = COALESCE(excluded.side, circuit_lights.side),
+                            nth = COALESCE(excluded.nth, circuit_lights.nth),
+                            from_dir = COALESCE(excluded.from_dir, circuit_lights.from_dir),
+                            cross_street = COALESCE(excluded.cross_street, circuit_lights.cross_street),
                             sequence = COALESCE(excluded.sequence, circuit_lights.sequence),
                             location_note = COALESCE(excluded.location_note, circuit_lights.location_note)
                         """,
-                        (circ.get("id"), ln, seq, loc),
+                        (
+                            circ.get("id"),
+                            ln,
+                            (row.get("map_number") or "").strip() or None,
+                            (row.get("street") or "").strip() or None,
+                            (row.get("side") or "").strip() or None,
+                            nth_val,
+                            (row.get("from_dir") or "").strip() or None,
+                            (row.get("cross_street") or "").strip() or None,
+                            seq,
+                            loc,
+                        ),
                     )
                     n += 1
                 conn.commit()
                 st.success(f"Imported {n} light row(s).")
+                if skipped:
+                    st.warning("Skipped invalid sequences:\n" + "\n".join(skipped[:20]))
                 st.rerun()
 
     with tab_pdf:
@@ -1011,6 +1635,417 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     "No selectable text found. This is common with scanned drawings. "
                     "You can still keep the file here, but downstream detection needs a light-order list."
                 )
+
+
+STREET_WORDS = re.compile(
+    r"\b(street|st|avenue|ave|road|rd|drive|dr|boulevard|blvd|lane|ln|way|place|pl|court|ct)\b",
+    re.I,
+)
+AND_SPLIT = re.compile(r"\s+(?:and|&|@|at)\s+", re.I)
+
+
+def parse_address_query(text: str) -> dict:
+    """Pull house number, streets, side, and leftover words from a typed address."""
+    raw = (text or "").strip()
+    out = {
+        "raw": raw,
+        "house": None,
+        "side": "",
+        "streets": [],
+        "tokens": [],
+    }
+    if not raw:
+        return out
+    cleaned = STREET_WORDS.sub(" ", raw)
+    cleaned = re.sub(r"[.,#]", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    out["tokens"] = [t for t in re.split(r"\s+", cleaned.lower()) if t]
+
+    m = re.search(r"\b(\d{1,6})\b", cleaned)
+    if m:
+        try:
+            out["house"] = int(m.group(1))
+        except ValueError:
+            out["house"] = None
+
+    for tok in out["tokens"]:
+        if tok.upper() in {"N", "S", "E", "W", "NORTH", "SOUTH", "EAST", "WEST"}:
+            letter = {"NORTH": "N", "SOUTH": "S", "EAST": "E", "WEST": "W"}.get(
+                tok.upper(), tok.upper()[:1]
+            )
+            if letter in {"N", "S", "E", "W"}:
+                out["side"] = letter
+                break
+
+    parts = AND_SPLIT.split(cleaned)
+    streets = []
+    for part in parts:
+        p = STREET_WORDS.sub(" ", part)
+        p = re.sub(r"\b\d{1,6}\b", " ", p)
+        p = re.sub(r"\b[nsew]\b", " ", p, flags=re.I)
+        p = re.sub(r"\s+", " ", p).strip(" -")
+        if p:
+            streets.append(p)
+    # also keep individual leftover words longer than 1 char as street-ish
+    if not streets:
+        streets = [t for t in out["tokens"] if t.isalpha() and t.upper() not in {"N", "S", "E", "W"}]
+    out["streets"] = streets
+    return out
+
+
+def _num(val) -> int | None:
+    if val is None or val == "":
+        return None
+    try:
+        return int(str(val).strip())
+    except ValueError:
+        m = re.search(r"\d+", str(val))
+        return int(m.group()) if m else None
+
+
+def address_match_score(light: dict, parsed: dict) -> tuple[int, list[str]]:
+    """Higher is better. Reasons explain the hit."""
+    reasons = []
+    score = 0
+    blob = " ".join(
+        str(light.get(k) or "")
+        for k in (
+            "light_number",
+            "map_number",
+            "street",
+            "side",
+            "cross_street",
+            "location_note",
+            "circuit_number",
+        )
+    ).lower()
+
+    for street in parsed.get("streets") or []:
+        s = street.lower()
+        if len(s) < 2:
+            continue
+        if s in str(light.get("street") or "").lower():
+            score += 40
+            reasons.append(f"street {street}")
+        elif s in str(light.get("cross_street") or "").lower():
+            score += 35
+            reasons.append(f"cross {street}")
+        elif s in blob:
+            score += 20
+            reasons.append(f"mentions {street}")
+
+    if parsed.get("side"):
+        side = parsed["side"]
+        if str(light.get("side") or "").upper() == side:
+            score += 8
+            reasons.append(f"side {side}")
+
+    house = parsed.get("house")
+    map_n = _num(light.get("map_number"))
+    if house is not None and map_n is not None:
+        diff = abs(house - map_n)
+        if diff == 0:
+            score += 50
+            reasons.append(f"map # matches {house}")
+        elif diff <= 20:
+            score += 30
+            reasons.append(f"map #{map_n} near {house}")
+        elif diff <= 80:
+            score += 12
+            reasons.append(f"map #{map_n} same block-ish as {house}")
+
+    if house is not None and str(house) in blob and map_n != house:
+        score += 6
+        reasons.append(f"text has {house}")
+
+    if not reasons:
+        return 0, []
+    return score, reasons
+
+
+def search_lights_by_address(conn, query: str) -> list[dict]:
+    parsed = parse_address_query(query)
+    lights = q_all(
+        conn,
+        """
+        SELECT cl.*, c.circuit_number, c.circuit_type
+        FROM circuit_lights cl
+        JOIN circuits c ON c.id = cl.circuit_id
+        """,
+    )
+    scored = []
+    for row in lights:
+        score, reasons = address_match_score(row, parsed)
+        if score <= 0:
+            continue
+        item = dict(row)
+        item["score"] = score
+        item["reasons"] = reasons
+        scored.append(item)
+    scored.sort(key=lambda r: (-r["score"], str(r.get("circuit_number") or "")))
+    return scored, parsed
+
+
+def _fmt_when(val) -> str:
+    s = str(val or "").replace("T", " ")
+    if len(s) >= 16:
+        return s[:16]
+    return s or "—"
+
+
+def _yes(val) -> str:
+    return "Yes" if val else ""
+
+
+def page_light_history(conn) -> None:
+    st.header("Light history")
+    st.caption(
+        "One row per job or update on a head. Filter first, then scan flags as Yes / blank."
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    circuit = c1.text_input("Circuit")
+    callout = c2.text_input("Callout / light ID")
+    mapn = c3.text_input("Map #")
+    kind = c4.selectbox("Event type", ["All"] + TICKET_TYPES + ["update"])
+
+    events = q_all(conn, "SELECT * FROM light_events ORDER BY created_at DESC")
+    if not events:
+        st.info("No light history yet. Log a call with condition boxes checked.")
+        return
+
+    filtered = []
+    for e in events:
+        if circuit and circuit.lower() not in str(e.get("circuit_number") or "").lower():
+            continue
+        if callout and callout.lower() not in str(e.get("light_number") or "").lower():
+            continue
+        if mapn and mapn.lower() not in str(e.get("map_number") or "").lower():
+            continue
+        if kind != "All" and str(e.get("event_type") or "") != kind:
+            continue
+        filtered.append(e)
+
+    st.write(f"**{len(filtered)}** event(s)")
+    if not filtered:
+        st.warning("Nothing matches those filters.")
+        return
+
+    detail_rows = []
+    for e in filtered:
+        pole = " ".join(x for x in (e.get("pole_material"), e.get("pole_height")) if x)
+        detail_rows.append(
+            {
+                "Date": _fmt_when(e.get("created_at")),
+                "Circuit": e.get("circuit_number") or "",
+                "Callout": e.get("light_number") or "",
+                "Map #": e.get("map_number") or "",
+                "Ticket": e.get("ticket_id") or "",
+                "Type": e.get("event_type") or "",
+                "Down": _yes(e.get("knockdown")),
+                "Fixture bad": _yes(e.get("bad_fixture")),
+                "Igniter": _yes(e.get("bad_igniter")),
+                "UGT": _yes(e.get("ugt")),
+                "Vandal": _yes(e.get("vandalism")),
+                "Wire stolen": _yes(e.get("wire_stolen")),
+                "Pole": pole,
+                "Fixture": e.get("fixture_type") or "",
+                "Notes": (e.get("notes") or "").replace("\n", " · ")[:160],
+            }
+        )
+    detail = pd.DataFrame(detail_rows)
+
+    # Roll up: latest event per light
+    latest = {}
+    ever = {}
+    for e in reversed(filtered):
+        key = (e.get("circuit_number"), e.get("light_number"))
+        latest[key] = e
+        bag = ever.setdefault(key, set())
+        if e.get("knockdown"):
+            bag.add("Knockdown")
+        if e.get("bad_fixture"):
+            bag.add("Bad fixture")
+        if e.get("bad_igniter"):
+            bag.add("Bad igniter")
+        if e.get("ugt"):
+            bag.add("UGT")
+        if e.get("vandalism"):
+            bag.add("Vandalism")
+        if e.get("wire_stolen"):
+            bag.add("Wire stolen")
+
+    summary_rows = []
+    for (cn, ln), e in sorted(latest.items(), key=lambda kv: kv[0]):
+        pole = " ".join(x for x in (e.get("pole_material"), e.get("pole_height")) if x)
+        summary_rows.append(
+            {
+                "Circuit": cn or "",
+                "Callout": ln or "",
+                "Map #": e.get("map_number") or "",
+                "Last date": _fmt_when(e.get("created_at")),
+                "Last type": e.get("event_type") or "",
+                "All flags on file": ", ".join(sorted(ever.get((cn, ln), []))) or "—",
+                "Pole": pole or "—",
+                "Fixture": e.get("fixture_type") or "—",
+                "Events": sum(
+                    1
+                    for x in filtered
+                    if x.get("circuit_number") == cn and x.get("light_number") == ln
+                ),
+            }
+        )
+    summary = pd.DataFrame(summary_rows)
+
+    tab_sum, tab_log = st.tabs(["By light", "Full log"])
+
+    col_cfg_sum = {
+        "Circuit": st.column_config.TextColumn(width="small"),
+        "Callout": st.column_config.TextColumn(width="medium"),
+        "Map #": st.column_config.TextColumn(width="small"),
+        "Last date": st.column_config.TextColumn(width="small"),
+        "Last type": st.column_config.TextColumn(width="small"),
+        "All flags on file": st.column_config.TextColumn(width="medium"),
+        "Pole": st.column_config.TextColumn(width="small"),
+        "Fixture": st.column_config.TextColumn(width="small"),
+        "Events": st.column_config.NumberColumn(width="small"),
+    }
+    col_cfg_log = {
+        "Date": st.column_config.TextColumn(width="small"),
+        "Circuit": st.column_config.TextColumn(width="small"),
+        "Callout": st.column_config.TextColumn(width="medium"),
+        "Map #": st.column_config.TextColumn(width="small"),
+        "Ticket": st.column_config.TextColumn(width="small"),
+        "Type": st.column_config.TextColumn(width="small"),
+        "Down": st.column_config.TextColumn(width="small"),
+        "Fixture bad": st.column_config.TextColumn(width="small"),
+        "Igniter": st.column_config.TextColumn(width="small"),
+        "UGT": st.column_config.TextColumn(width="small"),
+        "Vandal": st.column_config.TextColumn(width="small"),
+        "Wire stolen": st.column_config.TextColumn(width="small"),
+        "Pole": st.column_config.TextColumn(width="small"),
+        "Fixture": st.column_config.TextColumn(width="small"),
+        "Notes": st.column_config.TextColumn(width="large"),
+    }
+
+    with tab_sum:
+        st.dataframe(
+            summary,
+            hide_index=True,
+            use_container_width=True,
+            column_config=col_cfg_sum,
+        )
+    with tab_log:
+        st.dataframe(
+            detail,
+            hide_index=True,
+            use_container_width=True,
+            column_config=col_cfg_log,
+        )
+
+    st.download_button(
+        "Download full log CSV",
+        detail.to_csv(index=False).encode("utf-8"),
+        "light_history.csv",
+        "text/csv",
+    )
+
+    if circuit.strip() and callout.strip():
+        st.subheader(f"Current file — {circuit.strip()}  ·  {callout.strip()}")
+        cur = q_one(
+            conn,
+            """
+            SELECT cl.*
+            FROM circuit_lights cl
+            JOIN circuits c ON c.id = cl.circuit_id
+            WHERE c.circuit_number = ? AND cl.light_number = ?
+            """,
+            (circuit.strip(), callout.strip()),
+        )
+        if cur:
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Map #", cur.get("map_number") or "—")
+            m2.metric("Pole", f"{cur.get('pole_material') or '—'} {cur.get('pole_height') or ''}".strip())
+            m3.metric("Fixture", cur.get("fixture_type") or "—")
+            m4.metric("Sequence", cur.get("sequence") or "—")
+            if cur.get("location_note"):
+                st.caption(cur.get("location_note"))
+        else:
+            st.caption("No Circuits & maps record for that callout yet.")
+
+
+def page_address_search(conn) -> None:
+    st.header("Address search")
+    st.caption(
+        "Type a house address or intersection. The app looks up **stored lights** "
+        "(street, cross street, map #, callout, notes) and lists likely **circuits**. "
+        "This is a best-guess from your light list — not GPS distance."
+    )
+    q = st.text_input(
+        "Physical address or intersection",
+        placeholder="312 W Mason St    or    1st and Mason",
+    )
+    if not q.strip():
+        n = q_one(conn, "SELECT COUNT(*) AS n FROM circuit_lights")
+        st.info(
+            f"{(n or {}).get('n', 0)} light(s) on file. "
+            "Add lights under Circuits & maps (street + map # + callout) so this search has something to match."
+        )
+        return
+
+    hits, parsed = search_lights_by_address(conn, q)
+    bits = []
+    if parsed.get("house") is not None:
+        bits.append(f"house **{parsed['house']}**")
+    if parsed.get("side"):
+        bits.append(f"side **{parsed['side']}**")
+    if parsed.get("streets"):
+        bits.append("streets **" + ", ".join(parsed["streets"]) + "**")
+    st.caption("Parsed: " + (", ".join(bits) if bits else parsed["raw"]))
+
+    if not hits:
+        st.warning("No stored lights matched. Add the nearby heads on Circuits & maps, then search again.")
+        return
+
+    st.write(f"**{len(hits)}** matching light(s)")
+
+    # Circuit summary first
+    by_c: dict[str, int] = {}
+    for h in hits:
+        cn = h.get("circuit_number") or "?"
+        by_c[cn] = by_c.get(cn, 0) + 1
+    top = sorted(by_c.items(), key=lambda kv: -kv[1])
+    st.subheader("Likely circuit(s)")
+    st.dataframe(
+        pd.DataFrame(
+            [{"Circuit": c, "Matching lights": n} for c, n in top]
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    rows = []
+    for h in hits[:80]:
+        rows.append(
+            {
+                "Score": h["score"],
+                "Circuit": h.get("circuit_number"),
+                "Callout": h.get("light_number"),
+                "Map #": h.get("map_number") or "",
+                "Spoken": spoken_callout(
+                    h.get("street") or "",
+                    h.get("side") or "",
+                    h.get("nth"),
+                    h.get("from_dir") or "",
+                    h.get("cross_street") or "",
+                ),
+                "Seq": h.get("sequence") or "",
+                "Branch": branch_label(h.get("sequence")),
+                "Why": "; ".join(h["reasons"]),
+                "Note": h.get("location_note") or "",
+            }
+        )
+    st.subheader("Nearest stored lights (by map # and street text)")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 def page_reports(conn: sqlite3.Connection) -> None:
@@ -1065,7 +2100,15 @@ def main() -> None:
 
     page = st.sidebar.radio(
         "Go to",
-        ["Active calls", "New call", "History", "Circuits & maps", "Reports"],
+        [
+            "Active calls",
+            "New call",
+            "Address search",
+            "Light history",
+            "History",
+            "Circuits & maps",
+            "Reports",
+        ],
     )
 
     backend = "Turso (cloud)" if using_turso() else "Local SQLite"
@@ -1079,6 +2122,10 @@ def main() -> None:
         page_active(conn)
     elif page == "New call":
         page_new_call(conn)
+    elif page == "Address search":
+        page_address_search(conn)
+    elif page == "Light history":
+        page_light_history(conn)
     elif page == "History":
         page_history(conn)
     elif page == "Circuits & maps":
