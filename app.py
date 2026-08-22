@@ -35,7 +35,27 @@ TICKET_TYPES = [
     "UGT",
     "Vandalism",
     "Wire stolen",
+    "Tag out",
     "Other",
+]
+OUTAGE_CAUSES = [
+    "",
+    "Natural / component (lamp, photocell, igniter, driver)",
+    "Damage (vehicle, storm, knockdown)",
+    "Theft / vandalism / stolen wire",
+    "Pedestal or cable cut",
+    "UGT (underground to this light only)",
+    "Unknown",
+]
+BOARD_FILTERS = [
+    "All",
+    "Circuit troubles (LUB/FUD)",
+    "Damages",
+    "Theft / vandalism",
+    "Tag outs",
+    "Knockdowns",
+    "Fixture / component",
+    "UGT",
 ]
 POLE_MATERIALS = ["", "Aluminum", "Concrete", "Wood", "Steel", "Unknown"]
 CONDITION_FLAGS = [
@@ -46,6 +66,7 @@ CONDITION_FLAGS = [
     ("vandalism", "Vandalized"),
     ("wire_stolen", "Wire stolen from this light"),
 ]
+PHOTO_DIR = DATA_DIR / "photos"
 # Stored values stay short; labels match Milwaukee DPW language.
 CIRCUIT_TYPE_LABELS = {
     "series": "Series (legacy constant-current)",
@@ -137,6 +158,15 @@ SCHEMA_STATEMENTS = [
         created_at TEXT NOT NULL,
         completed_at TEXT,
         completion_notes TEXT,
+        work_order TEXT,
+        created_by TEXT,
+        completed_by TEXT,
+        outage_cause TEXT,
+        findings TEXT,
+        photo_name TEXT,
+        photo_data TEXT,
+        is_tag_out INTEGER NOT NULL DEFAULT 0,
+        tag_reason TEXT,
         FOREIGN KEY (parent_ticket_id) REFERENCES tickets(id)
     )
     """,
@@ -154,6 +184,7 @@ def circuit_label(code: str | None) -> str:
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PDF_DIR.mkdir(parents=True, exist_ok=True)
+    PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _secret(name: str) -> str | None:
@@ -173,62 +204,83 @@ def using_turso() -> bool:
 
 def _auth_passwords() -> dict[str, str]:
     """
-    Secrets options (any one works):
-      APP_PASSWORD = "shared-code"
-      or
-      [passwords]
-      crew = "code1"
-      supervisor = "code2"
+    Secrets:
+      APP_PASSWORD = crew shared code
+      SUPERVISOR_PASSWORD = supervisor code
+      or [passwords] crew = "..." / supervisor = "..."
     """
     out: dict[str, str] = {}
-    single = _secret("APP_PASSWORD")
-    if single:
-        out["crew"] = single
+    crew = _secret("APP_PASSWORD")
+    if crew:
+        out["crew"] = crew
+    sup = _secret("SUPERVISOR_PASSWORD")
+    if sup:
+        out["supervisor"] = sup
     try:
         block = st.secrets.get("passwords")
         if block:
             for k, v in dict(block).items():
                 if v:
-                    out[str(k)] = str(v)
+                    out[str(k).lower()] = str(v)
     except Exception:
         pass
     return out
 
 
+def current_role() -> str:
+    return st.session_state.get("auth_role") or "crew"
+
+
+def current_user_name() -> str:
+    return st.session_state.get("auth_name") or st.session_state.get("auth_user") or "crew"
+
+
+def is_supervisor() -> bool:
+    return current_role() == "supervisor"
+
+
 def require_login() -> bool:
-    """Gate the app behind a password from secrets. Returns True if allowed."""
+    """Gate the app behind crew or supervisor password."""
     passwords = _auth_passwords()
     if not passwords:
-        # No password configured — allow access (local dev convenience).
-        # On Streamlit Cloud you should always set APP_PASSWORD.
+        st.session_state.setdefault("authenticated", True)
+        st.session_state.setdefault("auth_role", "supervisor")
+        st.session_state.setdefault("auth_name", "local")
         return True
 
     if st.session_state.get("authenticated"):
         with st.sidebar:
-            who = st.session_state.get("auth_user", "crew")
-            st.caption(f"Signed in as **{who}**")
+            who = current_user_name()
+            role = current_role()
+            st.caption(f"**{who}** · {role}")
             if st.button("Log out"):
-                st.session_state.authenticated = False
-                st.session_state.auth_user = None
+                for k in ("authenticated", "auth_user", "auth_name", "auth_role"):
+                    st.session_state[k] = None if k != "authenticated" else False
                 st.rerun()
         return True
 
     st.title("Street Light Tracker")
-    st.caption("Sign in to continue")
+    st.caption("Sign in as crew or supervisor")
     with st.form("login"):
-        user = st.text_input("Name / role (optional)", placeholder="crew")
+        role = st.selectbox("Role", ["crew", "supervisor"])
+        name = st.text_input("Your name", placeholder="e.g. Mike")
         pwd = st.text_input("Password", type="password")
         ok = st.form_submit_button("Sign in", type="primary")
     if ok:
-        user_key = (user or "crew").strip() or "crew"
-        # Accept either: exact user match, or the shared APP_PASSWORD for any name
-        expected = passwords.get(user_key) or passwords.get("crew")
+        expected = passwords.get(role)
+        if not expected and role == "crew":
+            expected = passwords.get("crew")
         if expected and pwd == expected:
             st.session_state.authenticated = True
-            st.session_state.auth_user = user_key
+            st.session_state.auth_role = role
+            st.session_state.auth_name = (name or role).strip() or role
+            st.session_state.auth_user = st.session_state.auth_name
             st.rerun()
-        st.error("Wrong password.")
-    st.info("Ask your supervisor for the app password.")
+        st.error("Wrong password for that role.")
+    st.info(
+        "Secrets: `APP_PASSWORD` (crew), `SUPERVISOR_PASSWORD` (supervisor), "
+        "or `[passwords]` crew / supervisor entries."
+    )
     return False
 
 
@@ -351,6 +403,15 @@ def _migrate_tickets(conn) -> None:
             "fud": "ALTER TABLE tickets ADD COLUMN fud TEXT",
             "pedestal_cut": "ALTER TABLE tickets ADD COLUMN pedestal_cut INTEGER NOT NULL DEFAULT 0",
             "map_number": "ALTER TABLE tickets ADD COLUMN map_number TEXT",
+            "work_order": "ALTER TABLE tickets ADD COLUMN work_order TEXT",
+            "created_by": "ALTER TABLE tickets ADD COLUMN created_by TEXT",
+            "completed_by": "ALTER TABLE tickets ADD COLUMN completed_by TEXT",
+            "outage_cause": "ALTER TABLE tickets ADD COLUMN outage_cause TEXT",
+            "findings": "ALTER TABLE tickets ADD COLUMN findings TEXT",
+            "photo_name": "ALTER TABLE tickets ADD COLUMN photo_name TEXT",
+            "photo_data": "ALTER TABLE tickets ADD COLUMN photo_data TEXT",
+            "is_tag_out": "ALTER TABLE tickets ADD COLUMN is_tag_out INTEGER NOT NULL DEFAULT 0",
+            "tag_reason": "ALTER TABLE tickets ADD COLUMN tag_reason TEXT",
         }
         for name, sql in adds.items():
             if name not in cols:
@@ -817,15 +878,28 @@ def insert_ticket(
     fud: str = "",
     pedestal_cut: bool = False,
     map_number: str = "",
+    work_order: str = "",
+    created_by: str = "",
+    outage_cause: str = "",
+    photo_name: str = "",
+    photo_data: str = "",
+    is_tag_out: bool = False,
+    tag_reason: str = "",
 ) -> tuple[int, bool, str]:
-    flagged, reason, parent = check_duplicate(conn, circuit_number, light_number, lub, fud)
+    skip_dup = is_tag_out or ticket_type == "Tag out"
+    if skip_dup:
+        flagged, reason, parent = False, "", None
+    else:
+        flagged, reason, parent = check_duplicate(conn, circuit_number, light_number, lub, fud)
     cur = conn.execute(
         """
         INSERT INTO tickets (
             ticket_type, circuit_number, light_number, map_number, lub, fud, pedestal_cut,
             location, description,
-            status, is_flagged, flag_reason, parent_ticket_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)
+            status, is_flagged, flag_reason, parent_ticket_id, created_at,
+            work_order, created_by, outage_cause, photo_name, photo_data,
+            is_tag_out, tag_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ticket_type,
@@ -841,6 +915,13 @@ def insert_ticket(
             reason or None,
             parent,
             now_iso(),
+            _norm(work_order) or None,
+            _norm(created_by) or current_user_name(),
+            _norm(outage_cause) or None,
+            _norm(photo_name) or None,
+            photo_data or None,
+            1 if (is_tag_out or ticket_type == "Tag out") else 0,
+            _norm(tag_reason) or None,
         ),
     )
     conn.commit()
@@ -915,16 +996,328 @@ def log_light_event(
     conn.commit()
 
 
-def complete_ticket(conn: sqlite3.Connection, ticket_id: int, notes: str) -> None:
+UNDO_SECONDS = 45
+
+CONFIRM_STYLE = """
+<style>
+div[data-testid="stDialog"] div[role="dialog"],
+div[data-testid="stExpander"] {
+  border: 2px solid #b42318 !important;
+}
+.slt-confirm {
+  background: #fff4f2;
+  border: 2px solid #b42318;
+  border-radius: 10px;
+  padding: 0.85rem 1rem 1rem;
+  margin-bottom: 0.5rem;
+}
+.slt-confirm h3 { color: #b42318; margin: 0 0 0.4rem 0; font-size: 1.15rem; }
+.slt-confirm p { margin: 0.25rem 0; }
+.slt-confirm .target { font-size: 1.05rem; font-weight: 700; }
+</style>
+"""
+
+
+def _insert_row(conn, table: str, row: dict) -> None:
+    if not row:
+        return
+    cols = [k for k in row.keys() if not str(k).startswith("_")]
+    placeholders = ", ".join(["?"] * len(cols))
+    colsql = ", ".join(cols)
+    vals = [row.get(c) for c in cols]
+    conn.execute(f"INSERT INTO {table} ({colsql}) VALUES ({placeholders})", vals)
+
+
+def snapshot_light(conn, light_id) -> dict | None:
+    row = q_one(conn, "SELECT * FROM circuit_lights WHERE id = ?", (light_id,))
+    return dict(row) if row else None
+
+
+def snapshot_circuit(conn, circuit_id) -> dict | None:
+    circ = q_one(conn, "SELECT * FROM circuits WHERE id = ?", (circuit_id,))
+    if not circ:
+        return None
+    lights = q_all(conn, "SELECT * FROM circuit_lights WHERE circuit_id = ?", (circuit_id,))
+    pdfs = q_all(conn, "SELECT * FROM circuit_pdfs WHERE circuit_id = ?", (circuit_id,))
+    return {"circuit": dict(circ), "lights": [dict(r) for r in lights], "pdfs": [dict(r) for r in pdfs]}
+
+
+def restore_undo(conn, payload: dict) -> str:
+    kind = payload.get("kind")
+    if kind == "light":
+        _insert_row(conn, "circuit_lights", payload.get("row") or {})
+        conn.commit()
+        name = (payload.get("row") or {}).get("light_number") or "light"
+        return f"Restored light {name}."
+    if kind == "circuit":
+        snap = payload.get("snap") or {}
+        _insert_row(conn, "circuits", snap.get("circuit") or {})
+        for r in snap.get("lights") or []:
+            _insert_row(conn, "circuit_lights", r)
+        for r in snap.get("pdfs") or []:
+            _insert_row(conn, "circuit_pdfs", r)
+        conn.commit()
+        num = (snap.get("circuit") or {}).get("circuit_number") or "circuit"
+        return f"Restored circuit {num}."
+    return "Nothing to restore."
+
+
+def do_delete_light(conn, light_id) -> dict | None:
+    snap = snapshot_light(conn, light_id)
+    conn.execute("DELETE FROM circuit_lights WHERE id = ?", (light_id,))
+    conn.commit()
+    return snap
+
+
+def do_delete_circuit(conn, circuit_id) -> dict | None:
+    snap = snapshot_circuit(conn, circuit_id)
+    conn.execute("DELETE FROM circuit_pdfs WHERE circuit_id = ?", (circuit_id,))
+    conn.execute("DELETE FROM circuit_lights WHERE circuit_id = ?", (circuit_id,))
+    conn.execute("DELETE FROM circuits WHERE id = ?", (circuit_id,))
+    conn.commit()
+    return snap
+
+
+def set_undo(kind: str, label: str, extra: dict) -> None:
+    st.session_state["undo"] = {
+        "kind": kind,
+        "label": label,
+        "expires": datetime.now().timestamp() + UNDO_SECONDS,
+        **extra,
+    }
+
+
+def clear_delete_flags() -> None:
+    for k in (
+        "delete_light_id",
+        "delete_light_name",
+        "delete_light_circuit",
+        "delete_circuit",
+        "delete_circuit_id",
+    ):
+        st.session_state.pop(k, None)
+
+
+def render_undo_banner() -> None:
+    undo = st.session_state.get("undo")
+    if not undo:
+        return
+    if datetime.now().timestamp() > float(undo.get("expires") or 0):
+        st.session_state.pop("undo", None)
+        return
+    left = max(0, int(float(undo["expires"]) - datetime.now().timestamp()))
+    c1, c2 = st.columns([4, 1])
+    c1.warning(f"Deleted **{undo.get('label')}**. Undo available for {left}s.")
+    if c2.button("Undo", type="primary", key="undo_delete_btn"):
+        conn = get_conn()
+        try:
+            msg = restore_undo(conn, undo)
+        except Exception as exc:
+            conn.close()
+            st.session_state.pop("undo", None)
+            st.session_state["flash_err"] = f"Could not undo: {exc}"
+            st.rerun()
+            return
+        conn.close()
+        st.session_state.pop("undo", None)
+        st.session_state["flash_ok"] = msg
+        st.rerun()
+
+
+def confirm_delete(
+    title: str,
+    headline: str,
+    detail: str,
+    confirm_key: str,
+    on_confirm,
+    require_typed: str | None = None,
+) -> None:
+    """Shared delete confirmation (styled modal when Streamlit dialog exists)."""
+    st.markdown(CONFIRM_STYLE, unsafe_allow_html=True)
+
+    def _body():
+        st.markdown(
+            f'<div class="slt-confirm"><h3>{title}</h3>'
+            f'<p class="target">{headline}</p>'
+            f"<p>{detail}</p></div>",
+            unsafe_allow_html=True,
+        )
+        typed = ""
+        if require_typed:
+            typed = st.text_input(
+                f"Type {require_typed} to confirm",
+                key=f"{confirm_key}_typed",
+            )
+        c1, c2 = st.columns(2)
+        if c1.button("Yes, delete", type="primary", key=f"{confirm_key}_yes"):
+            if require_typed and typed.strip() != str(require_typed):
+                st.error("Confirmation text did not match.")
+            else:
+                on_confirm()
+        if c2.button("Cancel", key=f"{confirm_key}_no"):
+            clear_delete_flags()
+            st.rerun()
+
+    if hasattr(st, "dialog"):
+        @st.dialog(title)
+        def _dlg():
+            _body()
+
+        _dlg()
+    else:
+        _body()
+
+
+def _open_delete_light_dialog(light_id, name: str, circuit: str) -> None:
+    if not is_supervisor():
+        st.error("Only a **supervisor** can delete lights from the circuit map.")
+        clear_delete_flags()
+        return
+
+    def _go():
+        conn = get_conn()
+        try:
+            snap = do_delete_light(conn, light_id)
+        finally:
+            conn.close()
+        clear_delete_flags()
+        set_undo("light", f"light {name} on {circuit}", {"row": snap})
+        st.session_state["flash_ok"] = f"Deleted light {name}."
+        st.rerun()
+
+    confirm_delete(
+        title="Delete this light?",
+        headline=f"{name}  ·  circuit {circuit}",
+        detail="Removes the head from the circuit map. Tickets stay. You can Undo for a short time.",
+        confirm_key=f"light_{light_id}",
+        on_confirm=_go,
+    )
+
+
+def _open_delete_circuit_dialog(circuit_id, circuit_number: str) -> None:
+    if not is_supervisor():
+        st.error("Only a **supervisor** can delete circuits.")
+        clear_delete_flags()
+        return
+
+    def _go():
+        conn = get_conn()
+        try:
+            snap = do_delete_circuit(conn, circuit_id)
+        finally:
+            conn.close()
+        clear_delete_flags()
+        set_undo("circuit", f"circuit {circuit_number}", {"snap": snap})
+        st.session_state["flash_ok"] = f"Deleted circuit {circuit_number}."
+        st.rerun()
+
+    confirm_delete(
+        title="Delete this circuit?",
+        headline=str(circuit_number),
+        detail="Deletes the circuit, its lights, and PDF links. Tickets and light history stay. Undo is available briefly.",
+        confirm_key=f"circ_{circuit_id}",
+        on_confirm=_go,
+        require_typed=str(circuit_number),
+    )
+
+
+def complete_ticket(
+    conn: sqlite3.Connection,
+    ticket_id: int,
+    notes: str,
+    findings: str = "",
+    completed_by: str = "",
+) -> None:
     conn.execute(
         """
         UPDATE tickets
-        SET status = 'completed', completed_at = ?, completion_notes = ?
+        SET status = 'completed', completed_at = ?, completion_notes = ?,
+            findings = COALESCE(?, findings),
+            completed_by = ?
         WHERE id = ?
         """,
-        (now_iso(), notes.strip() or None, ticket_id),
+        (
+            now_iso(),
+            notes.strip() or None,
+            findings.strip() or None,
+            (completed_by or current_user_name()).strip() or None,
+            ticket_id,
+        ),
     )
     conn.commit()
+
+
+def board_category(row) -> str:
+    """Classify a ticket for active-board filters."""
+    t = str(row.get("ticket_type") or "")
+    if int(row.get("is_tag_out") or 0) == 1 or t == "Tag out":
+        return "Tag outs"
+    if t in ("Cable Theft", "Wire stolen", "Vandalism"):
+        return "Theft / vandalism"
+    if t == "Knockdown":
+        return "Knockdowns"
+    if t in ("Bad fixture", "Bad igniter"):
+        return "Fixture / component"
+    if t == "UGT":
+        return "UGT"
+    if t in ("Damage",):
+        return "Damages"
+    if t in ("Outage", "Pedestal cut") or row.get("lub") or row.get("fud"):
+        return "Circuit troubles (LUB/FUD)"
+    if t == "Damage":
+        return "Damages"
+    return "All"
+
+
+def filter_board(df: pd.DataFrame, board_filter: str) -> pd.DataFrame:
+    if df.empty or board_filter == "All":
+        return df
+    mask = df.apply(lambda r: board_category(r) == board_filter, axis=1)
+    return df[mask]
+
+
+def build_print_board_html(df: pd.DataFrame, title: str = "Active board") -> str:
+    rows = []
+    for _, r in df.iterrows():
+        tag = "TAG OUT" if int(r.get("is_tag_out") or 0) else (r.get("ticket_type") or "")
+        cause = r.get("outage_cause") or ""
+        rows.append(
+            f"<tr>"
+            f"<td>{r.get('id')}</td>"
+            f"<td>{tag}</td>"
+            f"<td>{r.get('circuit_number') or ''}</td>"
+            f"<td>{r.get('light_number') or ''}</td>"
+            f"<td>{r.get('lub') or ''}</td>"
+            f"<td>{r.get('fud') or ''}</td>"
+            f"<td>{cause}</td>"
+            f"<td>{r.get('work_order') or ''}</td>"
+            f"<td>{r.get('created_by') or ''}</td>"
+            f"<td>{r.get('location') or ''}</td>"
+            f"<td>{(r.get('tag_reason') or r.get('description') or '')[:80]}</td>"
+            f"</tr>"
+        )
+    body = "\n".join(rows) or "<tr><td colspan='11'>No calls</td></tr>"
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>{title}</title>
+<style>
+body {{ font-family: Arial, sans-serif; font-size: 12px; }}
+h1 {{ font-size: 18px; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #333; padding: 4px 6px; text-align: left; }}
+th {{ background: #eee; }}
+@media print {{ button {{ display: none; }} }}
+</style></head><body>
+<h1>{title}</h1>
+<p>Printed {datetime.now().strftime("%Y-%m-%d %H:%M")} · {len(df)} call(s)</p>
+<table>
+<thead><tr>
+<th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>
+<th>Cause</th><th>WO</th><th>Crew</th><th>Location</th><th>Notes / tag</th>
+</tr></thead>
+<tbody>{body}</tbody>
+</table>
+<script>window.onload = function() {{ /* optional auto print */ }}</script>
+</body></html>"""
 
 
 def reopen_ticket(conn: sqlite3.Connection, ticket_id: int) -> None:
@@ -953,6 +1346,165 @@ def tickets_df(conn, status: str | None = None) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+MAX_PHOTO_BYTES = 400_000  # ~400 KB before encode; keeps Turso rows small
+
+
+def encode_photo_limited(uploaded) -> tuple[str, str, str | None]:
+    """Return (name, base64_or_empty, error). Resizes/skips if too large."""
+    import base64
+
+    if uploaded is None:
+        return "", "", None
+    raw = uploaded.getvalue()
+    name = uploaded.name or "photo.jpg"
+    if len(raw) <= MAX_PHOTO_BYTES:
+        return name, base64.b64encode(raw).decode("ascii"), None
+    # Try to shrink with Pillow if available; else refuse
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(raw))
+        img = img.convert("RGB")
+        # progressive shrink
+        for max_side in (1280, 960, 720, 540):
+            w, h = img.size
+            scale = min(1.0, max_side / max(w, h))
+            if scale < 1.0:
+                img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=75, optimize=True)
+            data = buf.getvalue()
+            if len(data) <= MAX_PHOTO_BYTES:
+                return name.rsplit(".", 1)[0] + ".jpg", base64.b64encode(data).decode("ascii"), None
+        return "", "", "Photo still too large after resize. Use a smaller picture."
+    except Exception:
+        return (
+            "",
+            "",
+            f"Photo is {len(raw) // 1024} KB (limit ~{MAX_PHOTO_BYTES // 1024} KB). Use a smaller photo.",
+        )
+
+
+def active_tagouts_for_circuit(conn, circuit_number: str) -> list[dict]:
+    if not (circuit_number or "").strip():
+        return []
+    return q_all(
+        conn,
+        """
+        SELECT id, tag_reason, created_by, created_at, work_order, description
+        FROM tickets
+        WHERE status = 'active'
+          AND circuit_number = ?
+          AND (is_tag_out = 1 OR ticket_type = 'Tag out')
+        ORDER BY created_at DESC
+        """,
+        (circuit_number.strip(),),
+    )
+
+
+def release_tag_out(conn, ticket_id: int, notes: str = "", by: str = "") -> None:
+    complete_ticket(
+        conn,
+        ticket_id,
+        notes or "Tag released",
+        findings=notes or "Tag released — circuit cleared for service",
+        completed_by=by or current_user_name(),
+    )
+
+
+def show_ticket_photo(row) -> None:
+    import base64
+
+    data = row.get("photo_data") if isinstance(row, dict) else None
+    if data is None and hasattr(row, "get"):
+        data = row.get("photo_data")
+    if not data:
+        return
+    try:
+        raw = base64.b64decode(data)
+        st.image(raw, caption=(row.get("photo_name") if hasattr(row, "get") else None) or "Photo", width=360)
+    except Exception:
+        st.caption("Photo could not be displayed.")
+
+
+def build_shift_sheet_html(conn) -> str:
+    """Opens still active from before today + tickets completed today."""
+    today = date.today().isoformat()
+    opens = q_all(
+        conn,
+        """
+        SELECT * FROM tickets
+        WHERE status = 'active' AND date(created_at) < date(?)
+        ORDER BY circuit_number, created_at
+        """,
+        (today,),
+    )
+    closes = q_all(
+        conn,
+        """
+        SELECT * FROM tickets
+        WHERE status = 'completed' AND date(completed_at) = date(?)
+        ORDER BY completed_at
+        """,
+        (today,),
+    )
+    # Also include today's new actives
+    today_open = q_all(
+        conn,
+        """
+        SELECT * FROM tickets
+        WHERE status = 'active' AND date(created_at) = date(?)
+        ORDER BY created_at
+        """,
+        (today,),
+    )
+
+    def rows_html(rows, kind: str) -> str:
+        if not rows:
+            return f"<p><em>None ({kind})</em></p>"
+        parts = [
+            "<table><thead><tr>"
+            "<th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>"
+            "<th>Cause</th><th>WO</th><th>Crew</th><th>When</th><th>Notes</th>"
+            "</tr></thead><tbody>"
+        ]
+        for r in rows:
+            when = r.get("completed_at") or r.get("created_at") or ""
+            parts.append(
+                f"<tr><td>{r.get('id')}</td><td>{r.get('ticket_type') or ''}</td>"
+                f"<td>{r.get('circuit_number') or ''}</td>"
+                f"<td>{r.get('light_number') or ''}</td>"
+                f"<td>{r.get('lub') or ''}</td><td>{r.get('fud') or ''}</td>"
+                f"<td>{r.get('outage_cause') or ''}</td>"
+                f"<td>{r.get('work_order') or ''}</td>"
+                f"<td>{r.get('completed_by') or r.get('created_by') or ''}</td>"
+                f"<td>{str(when)[:16]}</td>"
+                f"<td>{(r.get('findings') or r.get('tag_reason') or r.get('description') or '')[:60]}</td>"
+                f"</tr>"
+            )
+        parts.append("</tbody></table>")
+        return "\n".join(parts)
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Shift sheet {today}</title>
+<style>
+body {{ font-family: Arial, sans-serif; font-size: 12px; }}
+h1,h2 {{ margin-bottom: 0.3rem; }}
+table {{ border-collapse: collapse; width: 100%; margin-bottom: 1rem; }}
+th, td {{ border: 1px solid #333; padding: 3px 5px; text-align: left; }}
+th {{ background: #eee; }}
+</style></head><body>
+<h1>Shift sheet — {today}</h1>
+<p>Generated {datetime.now().strftime("%Y-%m-%d %H:%M")}</p>
+<h2>Still open from before today ({len(opens)})</h2>
+{rows_html(opens, "carry-over")}
+<h2>Opened today still active ({len(today_open)})</h2>
+{rows_html(today_open, "today open")}
+<h2>Closed today ({len(closes)})</h2>
+{rows_html(closes, "closed")}
+</body></html>"""
+
+
 def filter_tickets(
     df: pd.DataFrame,
     q: str,
@@ -961,6 +1513,7 @@ def filter_tickets(
     ttype: str,
     start: date | None,
     end: date | None,
+    work_order: str = "",
 ) -> pd.DataFrame:
     if df.empty:
         return df
@@ -975,6 +1528,8 @@ def filter_tickets(
             | out.get("fud", pd.Series("", index=out.index)).astype(str).str.contains(light, case=False, na=False)
         )
         out = out[hit]
+    if work_order and "work_order" in out.columns:
+        out = out[out["work_order"].astype(str).str.contains(work_order, case=False, na=False)]
     if ttype and ttype != "All":
         out = out[out["ticket_type"] == ttype]
     if q:
@@ -988,6 +1543,8 @@ def filter_tickets(
             + out.get("lub", pd.Series("", index=out.index)).fillna("").astype(str)
             + " "
             + out.get("fud", pd.Series("", index=out.index)).fillna("").astype(str)
+            + " "
+            + out.get("work_order", pd.Series("", index=out.index)).fillna("").astype(str)
             + " "
             + out["location"].fillna("").astype(str)
             + " "
@@ -1008,8 +1565,8 @@ def filter_tickets(
 def page_new_call(conn: sqlite3.Connection) -> None:
     st.header("New call")
     st.caption(
-        "**LUB** = last unit burning (still on). **FUD** = first unit dark. "
-        "The break is between them — series fault or wires cut in a pedestal on a parallel LED circuit."
+        "**LUB** = last unit burning. **FUD** = first unit dark. "
+        "Pick an **outage cause** so a natural burnout is not mixed with damage or theft."
     )
 
     circuits = [
@@ -1017,14 +1574,41 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         for r in q_all(conn, "SELECT circuit_number FROM circuits ORDER BY circuit_number")
     ]
 
+    photo = st.file_uploader("Photo (optional, max ~400 KB after compress)", type=["jpg", "jpeg", "png", "webp"])
+    photo_name, photo_data, photo_err = encode_photo_limited(photo)
+    if photo_err:
+        st.error(photo_err)
+
+    # Live tag-out check when circuit typed in session (outside form for visibility)
+    circ_preview = st.text_input("Circuit to check for tag outs", key="tag_check_circ", placeholder="e.g. T1S-A")
+    if circ_preview.strip():
+        tags = active_tagouts_for_circuit(conn, circ_preview)
+        if tags:
+            for t in tags:
+                st.warning(
+                    f"**Circuit {circ_preview.strip()} is TAG OUT** — ticket #{t.get('id')}: "
+                    f"{t.get('tag_reason') or t.get('description') or 'no reason'} "
+                    f"(by {t.get('created_by') or '—'} · {str(t.get('created_at') or '')[:16]})"
+                )
+        else:
+            st.caption(f"No active tag out on {circ_preview.strip()}.")
+
     with st.form("new_call", clear_on_submit=True):
+        r1, r2, r3 = st.columns(3)
+        ticket_type = r1.selectbox("Type", TICKET_TYPES)
+        work_order = r2.text_input("Work order #", placeholder="city / WO number")
+        crew_name = r3.text_input("Crew name", value=current_user_name())
         c1, c2, c3 = st.columns(3)
-        ticket_type = c1.selectbox("Type", TICKET_TYPES)
-        circuit_number = c2.text_input("Circuit number *", placeholder="e.g. T1S-A")
-        map_number = c3.text_input("Map / plate #", placeholder="305 (can repeat on other streets)")
+        circuit_number = c1.text_input("Circuit number *", placeholder="e.g. T1S-A")
+        map_number = c2.text_input("Map / plate #", placeholder="305")
+        outage_cause = c3.selectbox("Outage / LUB-FUD cause", OUTAGE_CAUSES)
+        force_on_tag = st.checkbox(
+            "I know this circuit is tagged — log anyway",
+            value=False,
+            help="Required if there is an active tag out on this circuit (unless this ticket is the tag out).",
+        )
         st.caption(
-            "Identify the **head** by street callout, not plate # alone. "
-            "Example: west side of 1st, first light north of Mason → **1 W 1 N Mason** (`1W-1N-Mason`)."
+            "Callout identifies the head (not plate # alone). Example: **1 W 1 N Mason** → `1W-1N-Mason`."
         )
         a1, a2, a3, a4, a5 = st.columns(5)
         street = a1.text_input("Street", placeholder="1 or 1st")
@@ -1032,15 +1616,18 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         nth = a3.number_input("Nth light from cross", min_value=0, step=1, value=0)
         from_dir = a4.selectbox("Direction from cross", DIRS)
         cross = a5.text_input("Cross street", placeholder="Mason")
-        callout_override = st.text_input(
-            "Callout (optional if you filled the boxes)",
-            placeholder="1W-1N-Mason or 1 W 1 N Mason",
-        )
+        callout_override = st.text_input("Callout (optional)", placeholder="1W-1N-Mason")
         l1, l2, l3 = st.columns(3)
         lub = l1.text_input("LUB — last unit burning", placeholder="1W-1N-Mason")
         fud = l2.text_input("FUD — first unit dark", placeholder="1W-2N-Mason")
         pedestal_cut = l3.checkbox("Wires cut in pedestal")
         location = st.text_input("Location / intersection", placeholder="1st & Mason")
+        st.markdown("**Tag out (circuit or area locked out)**")
+        is_tag = st.checkbox("This is a tag out")
+        tag_reason = st.text_input(
+            "Tag-out reason",
+            placeholder="Damage / other dept digging near circuit / feeder de-energized",
+        )
         st.markdown("**Condition of this light**")
         f1, f2, f3 = st.columns(3)
         knockdown = f1.checkbox("Knocked down")
@@ -1054,30 +1641,49 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         pole_material = p1.selectbox("Pole type", POLE_MATERIALS)
         pole_height = p2.text_input("Pole height", placeholder="e.g. 30 ft")
         fixture_type = p3.text_input("Fixture type", placeholder="e.g. LED cobra / acorn")
-        description = st.text_area("Notes", placeholder="LUB / FUD. Pedestal between them cut.")
+        description = st.text_area("Notes", placeholder="Details for the next shift")
         submitted = st.form_submit_button("Log call", type="primary")
 
     if submitted:
         if not circuit_number.strip():
             st.error("Circuit number is required.")
             return
+        if photo_err:
+            st.error(photo_err)
+            return
         built = format_callout(street, side, nth if nth else "", from_dir, cross)
         spoken = spoken_callout(street, side, nth if nth else "", from_dir, cross)
         light_id = (callout_override or "").strip() or built or (map_number or "").strip()
         loc = location.strip() or spoken
+        ttype = "Tag out" if is_tag else ticket_type
+        if is_tag and not light_id:
+            light_id = "TAGOUT"
+        existing_tags = active_tagouts_for_circuit(conn, circuit_number)
+        if existing_tags and not is_tag and not force_on_tag:
+            msgs = "; ".join(
+                f"#{t.get('id')} {t.get('tag_reason') or t.get('description') or 'tagged'}"
+                for t in existing_tags[:3]
+            )
+            st.error(
+                f"Circuit **{circuit_number.strip()}** is under active tag out ({msgs}). "
+                "Check **I know this circuit is tagged — log anyway** to force, or release the tag first."
+            )
+            return
         get_or_create_circuit(conn, circuit_number)
         flags = {
-            "knockdown": knockdown or ticket_type == "Knockdown",
-            "bad_fixture": bad_fixture or ticket_type == "Bad fixture",
-            "bad_igniter": bad_igniter or ticket_type == "Bad igniter",
-            "ugt": ugt or ticket_type == "UGT",
-            "vandalism": vandalism or ticket_type == "Vandalism",
-            "wire_stolen": wire_stolen or ticket_type == "Wire stolen",
+            "knockdown": knockdown or ttype == "Knockdown",
+            "bad_fixture": bad_fixture or ttype == "Bad fixture",
+            "bad_igniter": bad_igniter or ttype == "Bad igniter",
+            "ugt": ugt or ttype == "UGT",
+            "vandalism": vandalism or ttype == "Vandalism",
+            "wire_stolen": wire_stolen or ttype == "Wire stolen",
         }
         extra = []
         for key, label in CONDITION_FLAGS:
             if flags.get(key):
                 extra.append(label)
+        if outage_cause:
+            extra.append(f"cause: {outage_cause}")
         if pole_material:
             extra.append(f"pole {pole_material} {pole_height}".strip())
         if fixture_type:
@@ -1087,29 +1693,37 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             desc = ((description or "").strip() + "\n" + "; ".join(extra)).strip()
         tid, flagged, reason = insert_ticket(
             conn,
-            ticket_type,
+            ttype,
             circuit_number,
             light_id,
             loc,
             desc,
             lub=lub,
             fud=fud,
-            pedestal_cut=pedestal_cut or ticket_type == "Pedestal cut",
+            pedestal_cut=pedestal_cut or ttype == "Pedestal cut",
             map_number=map_number,
+            work_order=work_order,
+            created_by=crew_name,
+            outage_cause=outage_cause,
+            photo_name=photo_name,
+            photo_data=photo_data,
+            is_tag_out=is_tag or ttype == "Tag out",
+            tag_reason=tag_reason,
         )
-        log_light_event(
-            conn,
-            circuit_number,
-            light_id,
-            map_number=map_number,
-            ticket_id=tid,
-            event_type=ticket_type,
-            flags=flags,
-            pole_material=pole_material,
-            pole_height=pole_height,
-            fixture_type=fixture_type,
-            notes=desc,
-        )
+        if light_id and light_id != "TAGOUT":
+            log_light_event(
+                conn,
+                circuit_number,
+                light_id,
+                map_number=map_number,
+                ticket_id=tid,
+                event_type=ttype,
+                flags=flags,
+                pole_material=pole_material,
+                pole_height=pole_height,
+                fixture_type=fixture_type,
+                notes=desc,
+            )
         if flagged:
             st.warning(f"Ticket #{tid} logged but **flagged**.\n\n{reason}")
         else:
@@ -1121,73 +1735,172 @@ def page_new_call(conn: sqlite3.Connection) -> None:
 
 
 def page_active(conn: sqlite3.Connection) -> None:
-    st.header("Active call log")
+    truck = st.session_state.get("truck_mode", False)
+    st.header("Active call log" + (" — TRUCK MODE" if truck else ""))
+    if truck:
+        st.markdown(
+            "<style>html, body, [class*='css'] { font-size: 1.15rem !important; }</style>",
+            unsafe_allow_html=True,
+        )
     df = tickets_df(conn, "active")
 
     c1, c2, c3, c4 = st.columns(4)
     q = c1.text_input("Search")
     circuit = c2.text_input("Circuit")
-    light = c3.text_input("Light #")
-    ttype = c4.selectbox("Type", ["All"] + TICKET_TYPES)
+    wo = c3.text_input("Work order #")
+    board = c4.selectbox("Board filter", BOARD_FILTERS)
+    if not truck:
+        light = st.text_input("Light / callout")
+        ttype = st.selectbox("Type", ["All"] + TICKET_TYPES)
+    else:
+        light, ttype = "", "All"
 
-    filtered = filter_tickets(df, q, circuit, light, ttype, None, None)
+    filtered = filter_tickets(df, q, circuit, light, ttype, None, None, work_order=wo)
+    filtered = filter_board(filtered, board)
 
     if filtered.empty:
         st.info("No active calls match.")
         return
 
-    st.write(f"**{len(filtered)}** active call(s)")
+    st.write(f"**{len(filtered)}** active · **{board}**")
 
     cols = [
         "id",
         "created_at",
         "ticket_type",
+        "is_tag_out",
         "circuit_number",
         "light_number",
         "map_number",
         "lub",
         "fud",
+        "outage_cause",
+        "work_order",
+        "created_by",
+        "tag_reason",
         "pedestal_cut",
         "location",
         "description",
         "is_flagged",
         "flag_reason",
-        "parent_ticket_id",
     ]
-    show = filtered[[c for c in cols if c in filtered.columns]].rename(
-        columns={
-            "id": "Ticket",
-            "created_at": "Logged",
-            "ticket_type": "Type",
-            "circuit_number": "Circuit",
-            "light_number": "Callout",
-            "map_number": "Map #",
-            "lub": "LUB",
-            "fud": "FUD",
-            "pedestal_cut": "Pedestal cut",
-            "location": "Location",
-            "description": "Notes",
-            "is_flagged": "Flagged",
-            "flag_reason": "Flag reason",
-            "parent_ticket_id": "Related #",
-        }
-    )
-    show["Flagged"] = show["Flagged"].map({1: "YES", 0: ""})
+    show = filtered[[c for c in cols if c in filtered.columns]].copy()
+    rename = {
+        "id": "Ticket",
+        "created_at": "Logged",
+        "ticket_type": "Type",
+        "is_tag_out": "Tag out",
+        "circuit_number": "Circuit",
+        "light_number": "Callout",
+        "map_number": "Map #",
+        "lub": "LUB",
+        "fud": "FUD",
+        "outage_cause": "Cause",
+        "work_order": "WO #",
+        "created_by": "Crew",
+        "tag_reason": "Tag reason",
+        "pedestal_cut": "Pedestal cut",
+        "location": "Location",
+        "description": "Notes",
+        "is_flagged": "Flagged",
+        "flag_reason": "Flag reason",
+    }
+    show = show.rename(columns={k: v for k, v in rename.items() if k in show.columns})
+    if "Tag out" in show.columns:
+        show["Tag out"] = show["Tag out"].map({1: "YES", 0: ""})
+    if "Flagged" in show.columns:
+        show["Flagged"] = show["Flagged"].map({1: "YES", 0: ""})
     if "Pedestal cut" in show.columns:
         show["Pedestal cut"] = show["Pedestal cut"].map({1: "YES", 0: ""})
     st.dataframe(show, use_container_width=True, hide_index=True)
 
-    st.subheader("Complete a call")
+    if not truck:
+        st.subheader("Print active board")
+        html = build_print_board_html(filtered, title=f"Active board — {board}")
+        st.download_button(
+            "Download board for print (HTML)",
+            html.encode("utf-8"),
+            file_name=f"active_board_{datetime.now().strftime('%Y%m%d_%H%M')}.html",
+            mime="text/html",
+        )
+        with st.expander("Preview print board"):
+            st.components.v1.html(html, height=360, scrolling=True)
+
+        st.subheader("Daily shift sheet")
+        shift_html = build_shift_sheet_html(conn)
+        st.download_button(
+            "Download shift sheet (HTML)",
+            shift_html.encode("utf-8"),
+            file_name=f"shift_sheet_{date.today().isoformat()}.html",
+            mime="text/html",
+        )
+
+    st.subheader("Complete or release tag")
     ids = filtered["id"].tolist()
-    col_a, col_b = st.columns([1, 2])
-    with col_a:
-        pick = st.selectbox("Ticket #", ids)
-    with col_b:
-        notes = st.text_input("Completion notes", placeholder="Replaced fuse / repaired cable / no trouble found")
-    if st.button("Mark completed", type="primary"):
-        complete_ticket(conn, int(pick), notes)
-        st.success(f"Ticket #{pick} moved to history.")
+    pick = st.selectbox("Ticket #", ids)
+    row = filtered[filtered["id"] == pick].iloc[0]
+    is_tag = int(row.get("is_tag_out") or 0) == 1 or str(row.get("ticket_type") or "") == "Tag out"
+    st.caption(
+        f"{row.get('ticket_type')} · {row.get('circuit_number')} · "
+        f"{row.get('light_number') or ''} · WO {row.get('work_order') or '—'} · "
+        f"cause: {row.get('outage_cause') or '—'}"
+    )
+    if is_tag:
+        st.info(f"Tag reason: {row.get('tag_reason') or row.get('description') or '—'}")
+        rel_note = st.text_input("Release note", value="Tag released — circuit clear", key="rel_note")
+        if st.button("Release tag out", type="primary", key="btn_release_tag"):
+            release_tag_out(conn, int(pick), notes=rel_note)
+            st.success(f"Tag out #{pick} released.")
+            st.rerun()
+    findings = st.text_area(
+        "What we found / what we did",
+        placeholder="Replaced photocell · repaired cut · no trouble found",
+        key="complete_findings",
+    )
+    notes = st.text_input("Short closeout note", placeholder="Optional one-liner")
+    closer = st.text_input("Closed by", value=current_user_name())
+    if st.button("Mark completed", type="primary", key="btn_complete"):
+        complete_ticket(conn, int(pick), notes, findings=findings, completed_by=closer)
+        st.success(f"Ticket #{pick} completed by {closer}.")
         st.rerun()
+
+    if "photo_data" in filtered.columns:
+        prow = filtered[filtered["id"] == pick]
+        if not prow.empty:
+            show_ticket_photo(prow.iloc[0].to_dict())
+
+
+def page_backup(conn) -> None:
+    st.header("Backup download")
+    if not is_supervisor():
+        st.warning("Backup is **supervisor only**. Sign in with the supervisor password.")
+        return
+    st.caption("Download tables as CSV (zip). Keep a copy outside Streamlit/Turso.")
+    import zipfile
+
+    tables = {
+        "tickets": "SELECT * FROM tickets ORDER BY id",
+        "circuits": "SELECT * FROM circuits ORDER BY id",
+        "circuit_lights": "SELECT * FROM circuit_lights ORDER BY id",
+        "light_events": "SELECT * FROM light_events ORDER BY id",
+        "circuit_pdfs": "SELECT id, circuit_id, filename, uploaded_at FROM circuit_pdfs ORDER BY id",
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, sql in tables.items():
+            rows = q_all(conn, sql)
+            df = pd.DataFrame(rows) if rows else pd.DataFrame()
+            # Drop bulky photo_data from ticket export to keep zip usable
+            if name == "tickets" and not df.empty and "photo_data" in df.columns:
+                df = df.drop(columns=["photo_data"])
+            zf.writestr(f"{name}.csv", df.to_csv(index=False))
+    st.download_button(
+        "Download full backup (ZIP of CSVs)",
+        buf.getvalue(),
+        file_name=f"streetlight_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+        mime="application/zip",
+    )
+    st.success("Signed in as supervisor — full backup allowed (photos omitted from CSV).")
 
 
 def page_history(conn: sqlite3.Connection) -> None:
@@ -1201,7 +1914,8 @@ def page_history(conn: sqlite3.Connection) -> None:
     q = c1.text_input("Keyword")
     circuit = c2.text_input("Circuit")
     light = c3.text_input("Light #")
-    ttype = c4.selectbox("Type", ["All"] + TICKET_TYPES)
+    wo = c4.text_input("Work order #")
+    ttype = st.selectbox("Type", ["All"] + TICKET_TYPES)
 
     c5, c6, c7 = st.columns(3)
     status = c5.selectbox("Status", ["All", "active", "completed"])
@@ -1209,7 +1923,7 @@ def page_history(conn: sqlite3.Connection) -> None:
     end = c7.date_input("To", value=None)
 
     work = df if status == "All" else df[df["status"] == status]
-    filtered = filter_tickets(work, q, circuit, light, ttype, start, end)
+    filtered = filter_tickets(work, q, circuit, light, ttype, start, end, work_order=wo)
 
     st.write(f"**{len(filtered)}** record(s)")
     if filtered.empty:
@@ -1221,11 +1935,18 @@ def page_history(conn: sqlite3.Connection) -> None:
         "created_at",
         "completed_at",
         "ticket_type",
+        "is_tag_out",
         "circuit_number",
         "light_number",
         "map_number",
         "lub",
         "fud",
+        "outage_cause",
+        "work_order",
+        "created_by",
+        "completed_by",
+        "findings",
+        "tag_reason",
         "pedestal_cut",
         "location",
         "description",
@@ -1239,11 +1960,18 @@ def page_history(conn: sqlite3.Connection) -> None:
             "created_at": "Logged",
             "completed_at": "Completed",
             "ticket_type": "Type",
+            "is_tag_out": "Tag out",
             "circuit_number": "Circuit",
             "light_number": "Callout",
             "map_number": "Map #",
             "lub": "LUB",
             "fud": "FUD",
+            "outage_cause": "Cause",
+            "work_order": "WO #",
+            "created_by": "Opened by",
+            "completed_by": "Closed by",
+            "findings": "Findings",
+            "tag_reason": "Tag reason",
             "pedestal_cut": "Pedestal cut",
             "location": "Location",
             "description": "Notes",
@@ -1251,12 +1979,25 @@ def page_history(conn: sqlite3.Connection) -> None:
             "completion_notes": "Closeout",
         }
     )
+    if "Tag out" in show.columns:
+        show["Tag out"] = show["Tag out"].map({1: "YES", 0: ""})
     if "Pedestal cut" in show.columns:
         show["Pedestal cut"] = show["Pedestal cut"].map({1: "YES", 0: ""})
     st.dataframe(show, use_container_width=True, hide_index=True)
 
     csv_bytes = show.to_csv(index=False).encode("utf-8")
     st.download_button("Download results as CSV", csv_bytes, "streetlight_history.csv", "text/csv")
+
+    st.subheader("View photo")
+    with_photo = filtered
+    if "photo_data" in filtered.columns:
+        with_photo = filtered[filtered["photo_data"].notna() & (filtered["photo_data"].astype(str) != "")]
+    if with_photo.empty:
+        st.caption("No photos on these results.")
+    else:
+        pid = st.selectbox("Ticket with photo", with_photo["id"].tolist())
+        prow = with_photo[with_photo["id"] == pid].iloc[0]
+        show_ticket_photo(prow.to_dict())
 
     completed_ids = filtered.loc[filtered["status"] == "completed", "id"].tolist()
     if completed_ids:
@@ -1276,8 +2017,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
         "Same-leg downstream only is flagged as the same break."
     )
 
-    tab_list, tab_add, tab_import, tab_pdf = st.tabs(
-        ["Circuit list", "Add / edit circuit", "Import light order", "Upload PDF"]
+    tab_list, tab_add, tab_edit, tab_import, tab_pdf = st.tabs(
+        ["Circuit list", "Add circuit", "Edit / delete", "Import light order", "Upload PDF"]
     )
 
     with tab_list:
@@ -1311,10 +2052,45 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 "View lights on circuit",
                 [c.get("circuit_number") for c in circuits],
             )
+            picked = next((c for c in circuits if c.get("circuit_number") == pick), None)
+            a1, a2, a3 = st.columns([2, 1, 1])
+            a1.write(f"Selected **{pick}**")
+            if a2.button("Edit circuit", key=f"btn_edit_circ_{pick}"):
+                st.session_state["edit_circuit"] = pick
+            if a3.button("Delete circuit", key=f"btn_del_circ_{pick}"):
+                if picked and picked.get("id") is not None:
+                    st.session_state["delete_circuit"] = pick
+                    st.session_state["delete_circuit_id"] = picked.get("id")
+
+            if st.session_state.get("delete_circuit") == pick and picked:
+                _open_delete_circuit_dialog(picked.get("id"), pick)
+
+            if st.session_state.get("edit_circuit") == pick and picked:
+                with st.form("list_edit_circuit"):
+                    new_num = st.text_input("Circuit number", value=str(picked.get("circuit_number") or ""))
+                    types = CIRCUIT_TYPES
+                    cur_t = picked.get("circuit_type") or "unknown"
+                    idx = types.index(cur_t) if cur_t in types else types.index("unknown")
+                    new_type = st.selectbox("Circuit type", types, index=idx, format_func=circuit_label)
+                    new_desc = st.text_area("Notes", value=str(picked.get("description") or ""))
+                    save_c = st.form_submit_button("Save circuit")
+                if save_c and new_num.strip():
+                    conn.execute(
+                        "UPDATE circuits SET circuit_number = ?, circuit_type = ?, description = ? WHERE id = ?",
+                        (new_num.strip(), new_type, new_desc.strip() or None, picked.get("id")),
+                    )
+                    conn.commit()
+                    st.session_state["edit_circuit"] = None
+                    st.success("Circuit updated.")
+                    st.rerun()
+                if st.button("Cancel circuit edit"):
+                    st.session_state["edit_circuit"] = None
+                    st.rerun()
+
             lights = q_all(
                 conn,
                 """
-                SELECT cl.sequence, cl.light_number, cl.map_number, cl.street, cl.side,
+                SELECT cl.id, cl.sequence, cl.light_number, cl.map_number, cl.street, cl.side,
                        cl.nth, cl.from_dir, cl.cross_street, cl.location_note,
                        cl.pole_material, cl.pole_height, cl.fixture_type
                 FROM circuit_lights cl
@@ -1360,6 +2136,111 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+                st.caption("Edit / delete a light below")
+                for r in lights:
+                    lid = r.get("id")
+                    lab = f"{r.get('light_number')}  ·  #{r.get('map_number') or '—'}  ·  {r.get('sequence') or '—'}"
+                    c_l, c_e, c_d = st.columns([4, 1, 1])
+                    c_l.write(lab)
+                    if c_e.button("Edit", key=f"edit_l_{lid}"):
+                        st.session_state["edit_light_id"] = lid
+                    if c_d.button("Delete", key=f"del_l_{lid}"):
+                        st.session_state["delete_light_id"] = lid
+
+                edit_id = st.session_state.get("edit_light_id")
+                if edit_id:
+                    cur = next((x for x in lights if x.get("id") == edit_id), None)
+                    if cur:
+                        st.markdown(f"**Editing** {cur.get('light_number')}")
+                        with st.form("list_edit_light"):
+                            new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
+                            map_n = st.text_input("Map / plate #", value=str(cur.get("map_number") or ""))
+                            seq = st.text_input("Sequence", value=str(cur.get("sequence") or ""))
+                            loc = st.text_input("Location note", value=str(cur.get("location_note") or ""))
+                            e1, e2, e3 = st.columns(3)
+                            st_street = e1.text_input("Street", value=str(cur.get("street") or ""))
+                            side_val = str(cur.get("side") or "")
+                            st_side = e2.selectbox(
+                                "Side",
+                                SIDES,
+                                index=SIDES.index(side_val) if side_val in SIDES else 0,
+                            )
+                            nth_now = int(cur.get("nth") or 0)
+                            st_nth = e3.number_input("Nth from cross", min_value=0, step=1, value=nth_now)
+                            e4, e5 = st.columns(2)
+                            dir_val = str(cur.get("from_dir") or "")
+                            st_dir = e4.selectbox(
+                                "Dir from cross",
+                                DIRS,
+                                index=DIRS.index(dir_val) if dir_val in DIRS else 0,
+                            )
+                            st_cross = e5.text_input("Cross street", value=str(cur.get("cross_street") or ""))
+                            p1, p2, p3 = st.columns(3)
+                            pm = str(cur.get("pole_material") or "")
+                            pole_material = p1.selectbox(
+                                "Pole type",
+                                POLE_MATERIALS,
+                                index=POLE_MATERIALS.index(pm) if pm in POLE_MATERIALS else 0,
+                            )
+                            pole_height = p2.text_input("Pole height", value=str(cur.get("pole_height") or ""))
+                            fixture_type = p3.text_input("Fixture type", value=str(cur.get("fixture_type") or ""))
+                            save_l = st.form_submit_button("Save light")
+                        if save_l:
+                            err = validate_sequence_or_error(seq)
+                            if not new_callout.strip():
+                                st.error("Callout cannot be empty.")
+                            elif err:
+                                st.error(err)
+                            else:
+                                conn.execute(
+                                    """
+                                    UPDATE circuit_lights SET
+                                        light_number = ?, map_number = ?, street = ?, side = ?,
+                                        nth = ?, from_dir = ?, cross_street = ?, sequence = ?,
+                                        location_note = ?, pole_material = ?, pole_height = ?,
+                                        fixture_type = ?
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        new_callout.strip(),
+                                        map_n.strip() or None,
+                                        st_street.strip() or None,
+                                        st_side or None,
+                                        int(st_nth) if st_nth else None,
+                                        st_dir or None,
+                                        st_cross.strip() or None,
+                                        normalize_seq(seq) or None,
+                                        loc.strip() or None,
+                                        pole_material or None,
+                                        pole_height.strip() or None,
+                                        fixture_type.strip() or None,
+                                        edit_id,
+                                    ),
+                                )
+                                conn.commit()
+                                log_light_event(
+                                    conn,
+                                    pick,
+                                    new_callout.strip(),
+                                    map_number=map_n,
+                                    event_type="update",
+                                    pole_material=pole_material,
+                                    pole_height=pole_height,
+                                    fixture_type=fixture_type,
+                                    notes="Edited from circuit list",
+                                )
+                                st.session_state["edit_light_id"] = None
+                                st.success("Light saved.")
+                                st.rerun()
+                        if st.button("Cancel light edit"):
+                            st.session_state["edit_light_id"] = None
+                            st.rerun()
+
+                del_id = st.session_state.get("delete_light_id")
+                if del_id:
+                    cur = next((x for x in lights if x.get("id") == del_id), None)
+                    name = (cur.get("light_number") if cur else None) or str(del_id)
+                    _open_delete_light_dialog(del_id, name, pick)
             else:
                 st.caption("No light order stored for this circuit yet.")
 
@@ -1528,6 +2409,162 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         )
                     except sqlite3.Error as e:
                         st.error(str(e))
+
+    with tab_edit:
+        st.subheader("Edit or delete a light")
+        circs = q_all(conn, "SELECT circuit_number FROM circuits ORDER BY circuit_number")
+        circ_opts = [r.get("circuit_number") for r in circs]
+        if not circ_opts:
+            st.info("No circuits yet.")
+        else:
+            ecn = st.selectbox("Circuit", circ_opts, key="ed_cn")
+            lights_ed = q_all(
+                conn,
+                """
+                SELECT cl.*
+                FROM circuit_lights cl
+                JOIN circuits c ON c.id = cl.circuit_id
+                WHERE c.circuit_number = ?
+                """,
+                (ecn,),
+            )
+            lights_ed = sorted(
+                lights_ed,
+                key=lambda r: (seq_sort_key(r.get("sequence")), str(r.get("light_number") or "")),
+            )
+            if not lights_ed:
+                st.caption("No lights on this circuit.")
+            else:
+                labels = [
+                    f"{r.get('light_number')}  ·  map {r.get('map_number') or '—'}  ·  seq {r.get('sequence') or '—'}"
+                    for r in lights_ed
+                ]
+                pick_i = st.selectbox(
+                    "Light",
+                    range(len(lights_ed)),
+                    format_func=lambda i: labels[i],
+                    key="ed_light",
+                )
+                cur = lights_ed[pick_i]
+                with st.form("edit_light"):
+                    new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
+                    map_n = st.text_input("Map / plate #", value=str(cur.get("map_number") or ""))
+                    e1, e2, e3, e4, e5 = st.columns(5)
+                    st_street = e1.text_input("Street", value=str(cur.get("street") or ""))
+                    side_val = str(cur.get("side") or "")
+                    st_side = e2.selectbox(
+                        "Side",
+                        SIDES,
+                        index=SIDES.index(side_val) if side_val in SIDES else 0,
+                    )
+                    nth_now = int(cur.get("nth") or 0)
+                    st_nth = e3.number_input("Nth from cross", min_value=0, step=1, value=nth_now)
+                    dir_val = str(cur.get("from_dir") or "")
+                    st_dir = e4.selectbox(
+                        "Dir from cross",
+                        DIRS,
+                        index=DIRS.index(dir_val) if dir_val in DIRS else 0,
+                    )
+                    st_cross = e5.text_input("Cross street", value=str(cur.get("cross_street") or ""))
+                    seq = st.text_input("Sequence", value=str(cur.get("sequence") or ""))
+                    loc = st.text_input("Location note", value=str(cur.get("location_note") or ""))
+                    p1, p2, p3 = st.columns(3)
+                    pm = str(cur.get("pole_material") or "")
+                    pole_material = p1.selectbox(
+                        "Pole type",
+                        POLE_MATERIALS,
+                        index=POLE_MATERIALS.index(pm) if pm in POLE_MATERIALS else 0,
+                    )
+                    pole_height = p2.text_input("Pole height", value=str(cur.get("pole_height") or ""))
+                    fixture_type = p3.text_input("Fixture type", value=str(cur.get("fixture_type") or ""))
+                    save_l = st.form_submit_button("Save light changes")
+                if save_l:
+                    if not new_callout.strip():
+                        st.error("Callout cannot be empty.")
+                    else:
+                        err = validate_sequence_or_error(seq)
+                        if err:
+                            st.error(err)
+                        else:
+                            try:
+                                conn.execute(
+                                    """
+                                    UPDATE circuit_lights SET
+                                        light_number = ?, map_number = ?, street = ?, side = ?,
+                                        nth = ?, from_dir = ?, cross_street = ?, sequence = ?,
+                                        location_note = ?, pole_material = ?, pole_height = ?,
+                                        fixture_type = ?
+                                    WHERE id = ?
+                                    """,
+                                    (
+                                        new_callout.strip(),
+                                        map_n.strip() or None,
+                                        st_street.strip() or None,
+                                        st_side or None,
+                                        int(st_nth) if st_nth else None,
+                                        st_dir or None,
+                                        st_cross.strip() or None,
+                                        normalize_seq(seq) or None,
+                                        loc.strip() or None,
+                                        pole_material or None,
+                                        pole_height.strip() or None,
+                                        fixture_type.strip() or None,
+                                        cur.get("id"),
+                                    ),
+                                )
+                                conn.commit()
+                                log_light_event(
+                                    conn,
+                                    ecn,
+                                    new_callout.strip(),
+                                    map_number=map_n,
+                                    event_type="update",
+                                    pole_material=pole_material,
+                                    pole_height=pole_height,
+                                    fixture_type=fixture_type,
+                                    notes="Edited light record",
+                                )
+                                st.success(f"Updated {new_callout.strip()}.")
+                                st.rerun()
+                            except sqlite3.Error as e:
+                                st.error(str(e))
+
+                st.markdown("---")
+                st.subheader("Delete this light")
+                st.caption("Removes the light from the circuit map. Ticket history is kept.")
+                if st.button("Delete light…", type="primary", key="tab_del_light_btn"):
+                    st.session_state["delete_light_id"] = cur.get("id")
+                    st.session_state["delete_light_name"] = cur.get("light_number")
+                    st.session_state["delete_light_circuit"] = ecn
+                if st.session_state.get("delete_light_id") == cur.get("id"):
+                    _open_delete_light_dialog(
+                        cur.get("id"),
+                        str(cur.get("light_number") or cur.get("id")),
+                        ecn,
+                    )
+
+        st.markdown("---")
+        st.subheader("Delete a whole circuit")
+        st.caption(
+            "Deletes the circuit, its lights, and attached PDF records. "
+            "Tickets and light history stay so old jobs can still be searched."
+        )
+        circs2 = q_all(
+            conn,
+            "SELECT id, circuit_number FROM circuits ORDER BY circuit_number",
+        )
+        opts2 = [r.get("circuit_number") for r in circs2]
+        if opts2:
+            dcn = st.selectbox("Circuit to delete", opts2, key="del_cn")
+            if st.button("Delete circuit…", key="tab_del_circ_btn"):
+                row = next((r for r in circs2 if r.get("circuit_number") == dcn), None)
+                if row and row.get("id") is not None:
+                    st.session_state["delete_circuit"] = dcn
+                    st.session_state["delete_circuit_id"] = row.get("id")
+            if st.session_state.get("delete_circuit") == dcn:
+                row = next((r for r in circs2 if r.get("circuit_number") == dcn), None)
+                if row:
+                    _open_delete_circuit_dialog(row.get("id"), dcn)
 
     with tab_import:
         st.write(
@@ -2097,26 +3134,54 @@ def main() -> None:
 
     st.title("Street Light Tracker")
     st.caption("Outages · damage · cable theft — LUB / FUD, active log, history")
+    if st.session_state.get("flash_ok"):
+        st.success(st.session_state.pop("flash_ok"))
+    if st.session_state.get("flash_err"):
+        st.error(st.session_state.pop("flash_err"))
+    render_undo_banner()
 
-    page = st.sidebar.radio(
-        "Go to",
-        [
+    truck = st.sidebar.checkbox("Truck mode (simple)", value=st.session_state.get("truck_mode", False))
+    st.session_state["truck_mode"] = truck
+
+    if truck:
+        nav = ["Active calls", "New call", "History"]
+    elif is_supervisor():
+        nav = [
             "Active calls",
             "New call",
             "Address search",
             "Light history",
             "History",
             "Circuits & maps",
+            "Backup",
             "Reports",
-        ],
-    )
+        ]
+    else:
+        # Crew: no Circuits/Backup (supervisor only)
+        nav = [
+            "Active calls",
+            "New call",
+            "Address search",
+            "Light history",
+            "History",
+            "Reports",
+        ]
+
+    page = st.sidebar.radio("Go to", nav)
 
     backend = "Turso (cloud)" if using_turso() else "Local SQLite"
     st.sidebar.caption(f"Database: **{backend}**")
+    if not is_supervisor():
+        st.sidebar.caption("Crew view — Circuits & Backup need supervisor login")
 
     row = q_one(conn, "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active'")
     active_n = (row or {}).get("n", 0)
     st.sidebar.metric("Active now", active_n)
+    tag_n = q_one(
+        conn,
+        "SELECT COUNT(*) AS n FROM tickets WHERE status = 'active' AND (is_tag_out = 1 OR ticket_type = 'Tag out')",
+    )
+    st.sidebar.metric("Tag outs", (tag_n or {}).get("n", 0))
 
     if page == "Active calls":
         page_active(conn)
@@ -2126,10 +3191,15 @@ def main() -> None:
         page_address_search(conn)
     elif page == "Light history":
         page_light_history(conn)
+    elif page == "Backup":
+        page_backup(conn)
     elif page == "History":
         page_history(conn)
     elif page == "Circuits & maps":
-        page_circuits(conn)
+        if not is_supervisor():
+            st.warning("Circuits & maps is supervisor only.")
+        else:
+            page_circuits(conn)
     else:
         page_reports(conn)
 
