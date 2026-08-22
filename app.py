@@ -199,6 +199,15 @@ def display_ticket_type(val) -> str:
     return TICKET_TYPE_ALIASES.get(s, s)
 
 
+def record_label(row) -> str:
+    """What crews call the job: Record #, else internal id."""
+    wo = str(row.get("work_order") or "").strip()
+    tid = row.get("id")
+    if wo:
+        return f"{wo}  (#{tid})"
+    return f"#{tid}"
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PDF_DIR.mkdir(parents=True, exist_ok=True)
@@ -1366,6 +1375,63 @@ def _open_delete_circuit_dialog(circuit_id, circuit_number: str) -> None:
     )
 
 
+def update_active_ticket(
+    conn,
+    ticket_id: int,
+    ticket_type: str,
+    circuit_number: str,
+    light_number: str,
+    map_number: str,
+    lub: str,
+    fud: str,
+    location: str,
+    description: str,
+    work_order: str,
+    outage_cause: str,
+    tag_reason: str,
+    pedestal_cut: bool,
+    is_tag_out: bool,
+) -> None:
+    ttype = ticket_type
+    tag = 1 if (is_tag_out or ttype in TAG_OUT_TYPES) else 0
+    conn.execute(
+        """
+        UPDATE tickets SET
+            ticket_type = ?,
+            circuit_number = ?,
+            light_number = ?,
+            map_number = ?,
+            lub = ?,
+            fud = ?,
+            location = ?,
+            description = ?,
+            work_order = ?,
+            outage_cause = ?,
+            tag_reason = ?,
+            pedestal_cut = ?,
+            is_tag_out = ?
+        WHERE id = ? AND status = 'active'
+        """,
+        (
+            ttype,
+            _norm(circuit_number),
+            _norm(light_number) or None,
+            _norm(map_number) or None,
+            _norm(lub) or None,
+            _norm(fud) or None,
+            _norm(location) or None,
+            description if description is not None else None,
+            _norm(work_order) or None,
+            _norm(outage_cause) or None,
+            _norm(tag_reason) or None,
+            1 if pedestal_cut or ttype in PEDESTAL_CUT_TYPES else 0,
+            tag,
+            int(ticket_id),
+        ),
+    )
+    conn.commit()
+
+
 def complete_ticket(
     conn: sqlite3.Connection,
     ticket_id: int,
@@ -1907,7 +1973,7 @@ def page_active(conn: sqlite3.Connection) -> None:
     ]
     show = filtered[[c for c in cols if c in filtered.columns]].copy()
     rename = {
-        "id": "Ticket",
+        "id": "#",
         "created_at": "Logged",
         "ticket_type": "Type",
         "is_tag_out": "Tag out",
@@ -1959,8 +2025,9 @@ def page_active(conn: sqlite3.Connection) -> None:
         )
 
     st.subheader("Complete or release tag")
-    ids = filtered["id"].tolist()
-    pick = st.selectbox("Ticket #", ids)
+    pick_map = {record_label(r): int(r["id"]) for _, r in filtered.iterrows()}
+    pick_lab = st.selectbox("Record #", list(pick_map.keys()))
+    pick = pick_map[pick_lab]
     row = filtered[filtered["id"] == pick].iloc[0]
     is_tag = int(row.get("is_tag_out") or 0) == 1 or str(row.get("ticket_type") or "") in TAG_OUT_TYPES
     st.caption(
@@ -1968,6 +2035,63 @@ def page_active(conn: sqlite3.Connection) -> None:
         f"{row.get('light_number') or ''} · Rec {row.get('work_order') or '—'} · "
         f"cause: {row.get('outage_cause') or '—'}"
     )
+    if is_supervisor():
+        with st.expander("Edit this call (supervisor)"):
+            types = list(TICKET_TYPES)
+            cur_type = display_ticket_type(row.get("ticket_type"))
+            if cur_type not in types:
+                types = [cur_type] + types
+            with st.form(f"edit_active_{int(pick)}"):
+                e1, e2, e3 = st.columns(3)
+                etype = e1.selectbox("Type", types, index=types.index(cur_type) if cur_type in types else 0)
+                ecirc = e2.text_input("Circuit", value=str(row.get("circuit_number") or ""))
+                ewo = e3.text_input("Record #", value=str(row.get("work_order") or ""))
+                e4, e5, e6 = st.columns(3)
+                eloc_id = e4.text_input("Location", value=str(row.get("light_number") or ""))
+                emap = e5.text_input("Light #", value=str(row.get("map_number") or ""))
+                ecause = e6.selectbox(
+                    "Cause",
+                    OUTAGE_CAUSES,
+                    index=OUTAGE_CAUSES.index(row.get("outage_cause"))
+                    if row.get("outage_cause") in OUTAGE_CAUSES
+                    else 0,
+                )
+                e7, e8, e9 = st.columns(3)
+                elub = e7.text_input("LUB", value=str(row.get("lub") or ""))
+                efud = e8.text_input("FUD", value=str(row.get("fud") or ""))
+                eped = e9.checkbox(
+                    "Wires cut in pedestal",
+                    value=int(row.get("pedestal_cut") or 0) == 1
+                    or str(row.get("ticket_type") or "") in PEDESTAL_CUT_TYPES,
+                )
+                elocation = st.text_input("Intersection", value=str(row.get("location") or ""))
+                edesc = st.text_area("Notes", value=str(row.get("description") or ""))
+                etag = st.checkbox("This is a tag out", value=is_tag)
+                etag_r = st.text_input("Tag reason", value=str(row.get("tag_reason") or ""))
+                save_ed = st.form_submit_button("Save changes", type="primary")
+            if save_ed:
+                if not ecirc.strip():
+                    st.error("Circuit is required.")
+                else:
+                    update_active_ticket(
+                        conn,
+                        int(pick),
+                        etype,
+                        ecirc,
+                        eloc_id,
+                        emap,
+                        elub,
+                        efud,
+                        elocation,
+                        edesc,
+                        ewo,
+                        ecause,
+                        etag_r,
+                        eped,
+                        etag,
+                    )
+                    st.success(f"Ticket #{pick} updated.")
+                    st.rerun()
     if is_tag:
         st.info(f"Tag reason: {row.get('tag_reason') or row.get('description') or '—'}")
         rel_note = st.text_input("Release note", value="Tag released — circuit clear", key="rel_note")
@@ -2078,7 +2202,7 @@ def page_history(conn: sqlite3.Connection) -> None:
     ]
     show = filtered[[c for c in hcols if c in filtered.columns]].rename(
         columns={
-            "id": "Ticket",
+            "id": "#",
             "status": "Status",
             "created_at": "Logged",
             "completed_at": "Completed",
@@ -2120,14 +2244,19 @@ def page_history(conn: sqlite3.Connection) -> None:
     if with_photo.empty:
         st.caption("No photos on these results.")
     else:
-        pid = st.selectbox("Ticket with photo", with_photo["id"].tolist())
+        pmap = {record_label(r): int(r["id"]) for _, r in with_photo.iterrows()}
+        pid_lab = st.selectbox("Record # with photo", list(pmap.keys()))
+        pid = pmap[pid_lab]
         prow = with_photo[with_photo["id"] == pid].iloc[0]
         show_ticket_photo(prow.to_dict())
 
     completed_ids = filtered.loc[filtered["status"] == "completed", "id"].tolist()
     if completed_ids:
         st.subheader("Reopen a completed ticket")
-        rid = st.selectbox("Ticket # to reopen", completed_ids)
+        completed = filtered.loc[filtered["status"] == "completed"]
+        rmap = {record_label(r): int(r["id"]) for _, r in completed.iterrows()}
+        rid_lab = st.selectbox("Record # to reopen", list(rmap.keys()))
+        rid = rmap[rid_lab]
         if st.button("Reopen"):
             reopen_ticket(conn, int(rid))
             st.success(f"Ticket #{rid} is active again.")
@@ -3372,7 +3501,7 @@ def estimate_lights_out(conn, active_df: pd.DataFrame) -> tuple[int, list[dict],
         all_keys |= keys
         rows.append(
             {
-                "Ticket": td.get("id"),
+                "Record #": td.get("work_order") or td.get("id"),
                 "Type": display_ticket_type(td.get("ticket_type")),
                 "Circuit": td.get("circuit_number"),
                 "Location": td.get("light_number") or "",
