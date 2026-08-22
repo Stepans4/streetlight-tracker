@@ -2383,8 +2383,9 @@ def page_circuits(conn: sqlite3.Connection) -> None:
 
         st.subheader("Add a single light to the sequence")
         st.caption(
-            "Unique ID is the **callout** (1W-1N-Mason), not map #305. "
-            "Sequence: `1`, `1a`, `1a1`, `1b`."
+            "Identify the head by **Location** (street, side, nth light from the cross, and cross street) "
+            "plus **Light #** if you have it. Light # can repeat on other streets. "
+            "Sequence from the print: `1`, `1a`, `1a1`, `1b`."
         )
         with st.form("add_light"):
             cn2 = st.text_input("Circuit number", key="al_cn")
@@ -2395,7 +2396,10 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             st_nth = b3.number_input("Nth from cross", min_value=0, step=1, value=0, key="al_nth")
             st_dir = b4.selectbox("Dir from cross", DIRS, key="al_dir")
             st_cross = b5.text_input("Cross street", placeholder="Mason")
-            ln = st.text_input("Location override (optional)", placeholder="leave blank to auto-build 1W-1N-Mason")
+            ln = st.text_input(
+                "Location (optional if you filled the boxes)",
+                placeholder="leave blank to use street / side / nth / cross",
+            )
             seq = st.text_input(
                 "Sequence from source",
                 placeholder="1   or  1a   or  1a2",
