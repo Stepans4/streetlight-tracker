@@ -2095,7 +2095,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 [c.get("circuit_number") for c in circuits],
             )
             picked = next((c for c in circuits if c.get("circuit_number") == pick), None)
-            a1.write(f"Selected **{pick}**")
+            st.write(f"Selected **{pick}**")
             if can_edit:
                 a2, a3 = st.columns(2)
                 if a2.button("Edit circuit", key=f"btn_edit_circ_{pick}"):
