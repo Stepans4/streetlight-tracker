@@ -509,14 +509,16 @@ def _migrate_lights(conn) -> None:
 
 
 SIDES = ["", "N", "S", "E", "W"]
-DIRS = ["", "N", "S", "E", "W"]
+DIRS = ["", "N", "S", "E", "W", "@"]
 
 
 def format_callout(street: str, side: str, nth, from_dir: str, cross: str) -> str:
     """1 W 1 N Mason -> 1W-1N-Mason"""
     street = (street or "").strip()
     side = (side or "").strip().upper()
-    from_dir = (from_dir or "").strip().upper()
+    from_dir = (from_dir or "").strip()
+    if from_dir != "@":
+        from_dir = from_dir.upper()
     cross = (cross or "").strip()
     nth_s = str(nth).strip() if nth not in (None, "") else ""
     if not street:
@@ -547,7 +549,8 @@ def spoken_callout(street: str, side: str, nth, from_dir: str, cross: str) -> st
     if nth not in (None, ""):
         bits.append(str(nth).strip())
     if from_dir:
-        bits.append(str(from_dir).strip().upper())
+        d = str(from_dir).strip()
+        bits.append("at" if d == "@" else d.upper())
     if cross:
         bits.append(str(cross).strip())
     return " ".join(bits)
