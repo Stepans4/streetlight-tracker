@@ -1368,7 +1368,7 @@ th {{ background: #eee; }}
 <p>Printed {datetime.now().strftime("%Y-%m-%d %H:%M")} · {len(df)} call(s)</p>
 <table>
 <thead><tr>
-<th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>
+<th>#</th><th>Type</th><th>Circuit</th><th>Location</th><th>LUB</th><th>FUD</th>
 <th>Cause</th><th>Record #</th><th>Crew</th><th>Location</th><th>Notes / tag</th>
 </tr></thead>
 <tbody>{body}</tbody>
@@ -1521,7 +1521,7 @@ def build_shift_sheet_html(conn) -> str:
             return f"<p><em>None ({kind})</em></p>"
         parts = [
             "<table><thead><tr>"
-            "<th>#</th><th>Type</th><th>Circuit</th><th>Callout</th><th>LUB</th><th>FUD</th>"
+            "<th>#</th><th>Type</th><th>Circuit</th><th>Location</th><th>LUB</th><th>FUD</th>"
             "<th>Cause</th><th>Record #</th><th>Crew</th><th>When</th><th>Notes</th>"
             "</tr></thead><tbody>"
         ]
@@ -1650,21 +1650,20 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             value=False,
             help="Required if there is an active tag out on this circuit (unless this ticket is the tag out).",
         )
-        st.caption(
-            "Callout identifies the head (not Light # alone). Example: **1 W 1 N Mason** → `1W-1N-Mason`."
-        )
         a1, a2, a3, a4, a5 = st.columns(5)
         street = a1.text_input("Street", placeholder="1 or 1st")
         side = a2.selectbox("Side of street", SIDES)
         nth = a3.number_input("Nth light from cross", min_value=0, step=1, value=0)
         from_dir = a4.selectbox("Direction from cross", DIRS)
         cross = a5.text_input("Cross street", placeholder="Mason")
-        callout_override = st.text_input("Callout (optional)", placeholder="1W-1N-Mason")
         l1, l2, l3 = st.columns(3)
-        lub = l1.text_input("LUB — last unit burning", placeholder="1W-1N-Mason")
-        fud = l2.text_input("FUD — first unit dark", placeholder="1W-2N-Mason")
+        lub = l1.text_input("LUB — last unit burning", placeholder="last light still on")
+        fud = l2.text_input("FUD — first unit dark", placeholder="first light that's dark")
         pedestal_cut = l3.checkbox("Wires cut in pedestal")
-        location = st.text_input("Location / intersection", placeholder="1st & Mason")
+        location = st.text_input(
+            "Location",
+            placeholder="1st & Mason — or leave blank and use the boxes above",
+        )
         st.markdown("**Tag out (circuit or area locked out)**")
         is_tag = st.checkbox("This is a tag out")
         tag_reason = st.text_input(
@@ -1694,10 +1693,12 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         if photo_err:
             st.error(photo_err)
             return
-        built = format_callout(street, side, nth if nth else "", from_dir, cross)
         spoken = spoken_callout(street, side, nth if nth else "", from_dir, cross)
-        light_id = (callout_override or "").strip() or built or (map_number or "").strip()
         loc = location.strip() or spoken
+        light_id = loc or (map_number or "").strip()
+        if not light_id and not is_tag:
+            st.error("Enter Location, or Street + side + cross, or Light #.")
+            return
         ttype = "Tag Out" if is_tag else ticket_type
         if is_tag and not light_id:
             light_id = "TAGOUT"
@@ -1793,7 +1794,7 @@ def page_active(conn: sqlite3.Connection) -> None:
     wo = c3.text_input("Record #")
     board = c4.selectbox("Board filter", BOARD_FILTERS)
     if not truck:
-        light = st.text_input("Light / callout")
+        light = st.text_input("Location")
         ttype = st.selectbox("Type", ["All"] + TICKET_TYPES)
     else:
         light, ttype = "", "All"
@@ -1834,7 +1835,7 @@ def page_active(conn: sqlite3.Connection) -> None:
         "ticket_type": "Type",
         "is_tag_out": "Tag out",
         "circuit_number": "Circuit",
-        "light_number": "Callout",
+        "light_number": "Location",
         "map_number": "Light #",
         "lub": "LUB",
         "fud": "FUD",
@@ -2007,7 +2008,7 @@ def page_history(conn: sqlite3.Connection) -> None:
             "ticket_type": "Type",
             "is_tag_out": "Tag out",
             "circuit_number": "Circuit",
-            "light_number": "Callout",
+            "light_number": "Location",
             "map_number": "Light #",
             "lub": "LUB",
             "fud": "FUD",
@@ -2168,7 +2169,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         {
                             "Seq": seq or "—",
                             "Branch": branch_label(seq),
-                            "Callout": r.get("light_number"),
+                            "Location": r.get("light_number"),
                             "Light #": r.get("map_number") or "",
                             "Spoken": spoken_callout(
                                 r.get("street") or "",
@@ -2208,7 +2209,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     if cur:
                         st.markdown(f"**Editing** {cur.get('light_number')}")
                         with st.form("list_edit_light"):
-                            new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
+                            new_callout = st.text_input("Location", value=str(cur.get("light_number") or ""))
                             map_n = st.text_input("Light #", value=str(cur.get("map_number") or ""))
                             seq = st.text_input("Sequence", value=str(cur.get("sequence") or ""))
                             loc = st.text_input("Location note", value=str(cur.get("location_note") or ""))
@@ -2243,7 +2244,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                         if save_l:
                             err = validate_sequence_or_error(seq)
                             if not new_callout.strip():
-                                st.error("Callout cannot be empty.")
+                                st.error("Location cannot be empty.")
                             elif err:
                                 st.error(err)
                             else:
@@ -2394,7 +2395,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             st_nth = b3.number_input("Nth from cross", min_value=0, step=1, value=0, key="al_nth")
             st_dir = b4.selectbox("Dir from cross", DIRS, key="al_dir")
             st_cross = b5.text_input("Cross street", placeholder="Mason")
-            ln = st.text_input("Callout override (optional)", placeholder="leave blank to auto-build 1W-1N-Mason")
+            ln = st.text_input("Location override (optional)", placeholder="leave blank to auto-build 1W-1N-Mason")
             seq = st.text_input(
                 "Sequence from source",
                 placeholder="1   or  1a   or  1a2",
@@ -2410,7 +2411,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             built = format_callout(st_street, st_side, st_nth if st_nth else "", st_dir, st_cross)
             callout = (ln or "").strip() or built
             if not callout:
-                st.error("Enter a callout or street + side + cross so two #305s stay distinct.")
+                st.error("Enter a location so two lights with the same Light # stay distinct.")
             else:
                 err = validate_sequence_or_error(seq)
                 if err:
@@ -2504,7 +2505,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                 )
                 cur = lights_ed[pick_i]
                 with st.form("edit_light"):
-                    new_callout = st.text_input("Callout", value=str(cur.get("light_number") or ""))
+                    new_callout = st.text_input("Location", value=str(cur.get("light_number") or ""))
                     map_n = st.text_input("Light #", value=str(cur.get("map_number") or ""))
                     e1, e2, e3, e4, e5 = st.columns(5)
                     st_street = e1.text_input("Street", value=str(cur.get("street") or ""))
@@ -2537,7 +2538,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     save_l = st.form_submit_button("Save light changes")
                 if save_l:
                     if not new_callout.strip():
-                        st.error("Callout cannot be empty.")
+                        st.error("Location cannot be empty.")
                     else:
                         err = validate_sequence_or_error(seq)
                         if err:
@@ -2900,7 +2901,7 @@ def page_light_history(conn) -> None:
     )
     c1, c2, c3, c4 = st.columns(4)
     circuit = c1.text_input("Circuit")
-    callout = c2.text_input("Callout / light ID")
+    callout = c2.text_input("Location")
     mapn = c3.text_input("Light #")
     kind = c4.selectbox("Event type", ["All"] + TICKET_TYPES + ["update"])
 
@@ -2933,7 +2934,7 @@ def page_light_history(conn) -> None:
             {
                 "Date": _fmt_when(e.get("created_at")),
                 "Circuit": e.get("circuit_number") or "",
-                "Callout": e.get("light_number") or "",
+                "Location": e.get("light_number") or "",
                 "Light #": e.get("map_number") or "",
                 "Ticket": e.get("ticket_id") or "",
                 "Type": e.get("event_type") or "",
@@ -2976,7 +2977,7 @@ def page_light_history(conn) -> None:
         summary_rows.append(
             {
                 "Circuit": cn or "",
-                "Callout": ln or "",
+                "Location": ln or "",
                 "Light #": e.get("map_number") or "",
                 "Last date": _fmt_when(e.get("created_at")),
                 "Last type": e.get("event_type") or "",
@@ -2996,7 +2997,7 @@ def page_light_history(conn) -> None:
 
     col_cfg_sum = {
         "Circuit": st.column_config.TextColumn(width="small"),
-        "Callout": st.column_config.TextColumn(width="medium"),
+        "Location": st.column_config.TextColumn(width="medium"),
         "Light #": st.column_config.TextColumn(width="small"),
         "Last date": st.column_config.TextColumn(width="small"),
         "Last type": st.column_config.TextColumn(width="small"),
@@ -3008,7 +3009,7 @@ def page_light_history(conn) -> None:
     col_cfg_log = {
         "Date": st.column_config.TextColumn(width="small"),
         "Circuit": st.column_config.TextColumn(width="small"),
-        "Callout": st.column_config.TextColumn(width="medium"),
+        "Location": st.column_config.TextColumn(width="medium"),
         "Light #": st.column_config.TextColumn(width="small"),
         "Ticket": st.column_config.TextColumn(width="small"),
         "Type": st.column_config.TextColumn(width="small"),
@@ -3066,14 +3067,14 @@ def page_light_history(conn) -> None:
             if cur.get("location_note"):
                 st.caption(cur.get("location_note"))
         else:
-            st.caption("No Circuits & maps record for that callout yet.")
+            st.caption("No Circuits & maps record for that location yet.")
 
 
 def page_address_search(conn) -> None:
     st.header("Address search")
     st.caption(
         "Type a house address or intersection. The app looks up **stored lights** "
-        "(street, cross street, map #, callout, notes) and lists likely **circuits**. "
+        "(street, cross street, Light #, location, notes) and lists likely **circuits**. "
         "This is a best-guess from your light list — not GPS distance."
     )
     q = st.text_input(
@@ -3084,7 +3085,7 @@ def page_address_search(conn) -> None:
         n = q_one(conn, "SELECT COUNT(*) AS n FROM circuit_lights")
         st.info(
             f"{(n or {}).get('n', 0)} light(s) on file. "
-            "Add lights under Circuits & maps (street + map # + callout) so this search has something to match."
+            "Add lights under Circuits & maps (street + Light # + location) so this search has something to match."
         )
         return
 
@@ -3125,7 +3126,7 @@ def page_address_search(conn) -> None:
             {
                 "Score": h["score"],
                 "Circuit": h.get("circuit_number"),
-                "Callout": h.get("light_number"),
+                "Location": h.get("light_number"),
                 "Light #": h.get("map_number") or "",
                 "Spoken": spoken_callout(
                     h.get("street") or "",
