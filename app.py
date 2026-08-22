@@ -1756,15 +1756,6 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             "Tag-out reason",
             placeholder="Damage / other dept digging near circuit / feeder de-energized",
         )
-        st.markdown("**Condition of this light**")
-        f1, f2, f3 = st.columns(3)
-        knockdown = f1.checkbox("Knocked down")
-        bad_fixture = f2.checkbox("Bad fixture — replace")
-        bad_igniter = f3.checkbox("Bad igniter")
-        f4, f5, f6 = st.columns(3)
-        ugt = f4.checkbox("UGT (this light only)")
-        vandalism = f5.checkbox("Vandalized")
-        wire_stolen = False
         p1, p2, p3 = st.columns(3)
         pole_material = p1.selectbox("Pole type", POLE_MATERIALS)
         pole_height = p2.text_input("Pole height", placeholder="e.g. 30 ft")
@@ -1801,12 +1792,12 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             return
         get_or_create_circuit(conn, circuit_number)
         flags = {
-            "knockdown": knockdown or ttype == "Knockdown",
-            "bad_fixture": bad_fixture or ttype in ("Bad Fixture", "Bad fixture"),
-            "bad_igniter": bad_igniter or ttype in ("Bad Ignitor", "Bad igniter"),
-            "ugt": ugt or ttype == "UGT",
-            "vandalism": vandalism or ttype == "Vandalism",
-            "wire_stolen": wire_stolen or ttype == "Wire stolen",
+            "knockdown": ttype == "Knockdown",
+            "bad_fixture": ttype in ("Bad Fixture", "Bad fixture"),
+            "bad_igniter": ttype in ("Bad Ignitor", "Bad igniter"),
+            "ugt": ttype == "UGT",
+            "vandalism": ttype == "Vandalism",
+            "wire_stolen": ttype in ("Cable Theft", "Wire stolen"),
         }
         extra = []
         for key, label in CONDITION_FLAGS:
