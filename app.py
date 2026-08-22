@@ -805,6 +805,89 @@ def ranges_overlap_same_branch(new_lub, new_fud, old_lub, old_fud) -> bool:
     )
 
 
+def active_tickets_on_circuit(conn, circuit_number: str) -> list[dict]:
+    if not (circuit_number or "").strip():
+        return []
+    return q_all(
+        conn,
+        """
+        SELECT id, ticket_type, light_number, lub, fud, pedestal_cut, is_tag_out,
+               location, created_at, work_order
+        FROM tickets
+        WHERE status = 'active' AND circuit_number = ?
+        ORDER BY created_at
+        """,
+        (circuit_number.strip(),),
+    )
+
+
+def light_affected_by_ticket(conn, circuit_number: str, ticket: dict, light_number: str, sequence: str = "") -> str | None:
+    """If this head is the ticket unit or same-leg downstream, return a short reason."""
+    ln = _norm(light_number)
+    seq = normalize_seq(sequence) or get_light_sequence(conn, circuit_number, ln) if ln else normalize_seq(sequence)
+    units = ticket_units(ticket)
+    if ln and ln in units:
+        return "listed on this ticket (location / LUB / FUD)"
+    ttype = display_ticket_type(ticket.get("ticket_type"))
+    if int(ticket.get("is_tag_out") or 0) == 1 or ttype in TAG_OUT_TYPES:
+        return "circuit is tagged out"
+    if not seq:
+        return None
+    t_fud = get_light_sequence(conn, circuit_number, ticket.get("fud") or "")
+    t_lub = get_light_sequence(conn, circuit_number, ticket.get("lub") or "")
+    t_light = get_light_sequence(conn, circuit_number, ticket.get("light_number") or "")
+    dark_from = t_fud if t_fud is not None else t_light
+    if t_lub and same_branch_after(seq, t_lub):
+        return f"same leg after LUB {ticket.get('lub')}"
+    if dark_from and same_branch_at_or_after(seq, dark_from):
+        return f"same leg at/after FUD {ticket.get('fud') or ticket.get('light_number')}"
+    return None
+
+
+def lookup_active_warnings(
+    conn,
+    circuit_number: str,
+    light_number: str = "",
+    sequence: str = "",
+) -> list[str]:
+    """Yellow-note lines for Circuits / address / light lookup."""
+    tickets = active_tickets_on_circuit(conn, circuit_number)
+    if not tickets:
+        return []
+    notes = []
+    ln = _norm(light_number)
+    for t in tickets:
+        tid = t.get("id")
+        ttype = display_ticket_type(t.get("ticket_type"))
+        detail = light_affected_by_ticket(conn, circuit_number, t, ln, sequence)
+        if detail:
+            notes.append(
+                f"**{circuit_number}** · this light is under active **#{tid} {ttype}** — {detail} "
+                f"(LUB {t.get('lub') or '—'} / FUD {t.get('fud') or '—'})."
+            )
+        elif not ln:
+            notes.append(
+                f"**{circuit_number}** has active **#{tid} {ttype}** "
+                f"(LUB {t.get('lub') or '—'} / FUD {t.get('fud') or t.get('light_number') or '—'})."
+            )
+    if ln and not notes:
+        # circuit busy but this head not proven downstream
+        bits = [
+            f"#{t.get('id')} {display_ticket_type(t.get('ticket_type'))}"
+            for t in tickets
+        ]
+        notes.append(
+            f"**{circuit_number}** has active call(s) {', '.join(bits)} — "
+            "this head is not mapped as same-leg downstream (map sequences to refine)."
+        )
+    return notes
+
+
+def show_lookup_warnings(notes: list[str]) -> None:
+    for n in notes:
+        st.warning(n)
+
+
 def get_light_sequence(conn, circuit_number: str, light_number: str) -> str | None:
     row = q_one(
         conn,
@@ -2111,6 +2194,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             )
             picked = next((c for c in circuits if c.get("circuit_number") == pick), None)
             st.write(f"Selected **{pick}**")
+            show_lookup_warnings(lookup_active_warnings(conn, pick))
             if can_edit:
                 a2, a3 = st.columns(2)
                 if a2.button("Edit circuit", key=f"btn_edit_circ_{pick}"):
@@ -3066,8 +3150,19 @@ def page_light_history(conn) -> None:
             m4.metric("Sequence", cur.get("sequence") or "—")
             if cur.get("location_note"):
                 st.caption(cur.get("location_note"))
+            show_lookup_warnings(
+                lookup_active_warnings(
+                    conn,
+                    circuit.strip(),
+                    light_number=callout.strip(),
+                    sequence=str(cur.get("sequence") or ""),
+                )
+            )
         else:
             st.caption("No Circuits & maps record for that location yet.")
+            show_lookup_warnings(
+                lookup_active_warnings(conn, circuit.strip(), light_number=callout.strip())
+            )
 
 
 def page_address_search(conn) -> None:
@@ -3136,6 +3231,22 @@ def page_address_search(conn) -> None:
         )
     st.subheader("Nearest stored lights (by map # and street text)")
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+    seen_notes = set()
+    for cn, _n in top[:8]:
+        for note in lookup_active_warnings(conn, str(cn)):
+            if note not in seen_notes:
+                seen_notes.add(note)
+                st.warning(note)
+    for h in hits[:12]:
+        for note in lookup_active_warnings(
+            conn,
+            str(h.get("circuit_number") or ""),
+            light_number=str(h.get("light_number") or ""),
+            sequence=str(h.get("sequence") or ""),
+        ):
+            if note not in seen_notes:
+                seen_notes.add(note)
+                st.warning(note)
 
 
 def circuit_lights_list(conn, circuit_number: str) -> list[dict]:
