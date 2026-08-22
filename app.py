@@ -2174,14 +2174,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                             "Branch": branch_label(seq),
                             "Location": r.get("light_number"),
                             "Light #": r.get("map_number") or "",
-                            "Spoken": spoken_callout(
-                                r.get("street") or "",
-                                r.get("side") or "",
-                                r.get("nth"),
-                                r.get("from_dir") or "",
-                                r.get("cross_street") or "",
-                            ),
-                            "Location": r.get("location_note") or "",
+                            "Note": r.get("location_note") or "",
                             "Pole": " ".join(
                                 x for x in (r.get("pole_material"), r.get("pole_height")) if x
                             ),
@@ -3135,13 +3128,6 @@ def page_address_search(conn) -> None:
                 "Circuit": h.get("circuit_number"),
                 "Location": h.get("light_number"),
                 "Light #": h.get("map_number") or "",
-                "Spoken": spoken_callout(
-                    h.get("street") or "",
-                    h.get("side") or "",
-                    h.get("nth"),
-                    h.get("from_dir") or "",
-                    h.get("cross_street") or "",
-                ),
                 "Seq": h.get("sequence") or "",
                 "Branch": branch_label(h.get("sequence")),
                 "Why": "; ".join(h["reasons"]),
