@@ -2954,13 +2954,14 @@ def page_circuits(conn: sqlite3.Connection) -> None:
     if can_edit:
       with tab_import:
         st.write(
-            "CSV columns: `circuit_number,light_number,sequence,location` "
-            "plus optional `map_number,street,side,nth,from_dir,cross_street`."
+            "CSV columns: `circuit_number` plus street fields and/or `light_number`. "
+            "Optional: `map_number`, `sequence`, `fixture_type` (or `light_type`), "
+            "`pole_material`, `pole_height`, `location`."
         )
         st.code(
-            "circuit_number,light_number,map_number,street,side,nth,from_dir,cross_street,sequence,location\n"
-            "T1S-A,1W-1N-Mason,305,1,W,1,N,Mason,1a,W side 1st N of Mason\n"
-            "T1S-A,2W-1N-Mason,305,2,W,1,N,Mason,1b,W side 2nd N of Mason",
+            "circuit_number,map_number,street,side,nth,from_dir,cross_street,sequence,fixture_type\n"
+            "T1S-A,305,N 7,E,2,N,Hadley,1a2,LED cobra\n"
+            "T1S-A,307,N 7,E,3,N,Hadley,2a2,LED acorn",
             language="csv",
         )
         up = st.file_uploader("CSV file", type=["csv"])
@@ -2995,13 +2996,19 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                     loc = (row.get("location") or "").strip() or None
                     nth_raw = (row.get("nth") or "").strip()
                     nth_val = int(nth_raw) if nth_raw.isdigit() else None
+                    fixture = (
+                        (row.get("fixture_type") or row.get("light_type") or row.get("fixture") or "")
+                    ).strip() or None
+                    pole_m = (row.get("pole_material") or row.get("pole_type") or "").strip() or None
+                    pole_h = (row.get("pole_height") or "").strip() or None
                     conn.execute(
                         """
                         INSERT INTO circuit_lights (
                             circuit_id, light_number, map_number, street, side, nth,
-                            from_dir, cross_street, sequence, location_note
+                            from_dir, cross_street, sequence, location_note,
+                            fixture_type, pole_material, pole_height
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(circuit_id, light_number) DO UPDATE SET
                             map_number = COALESCE(excluded.map_number, circuit_lights.map_number),
                             street = COALESCE(excluded.street, circuit_lights.street),
@@ -3010,7 +3017,10 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                             from_dir = COALESCE(excluded.from_dir, circuit_lights.from_dir),
                             cross_street = COALESCE(excluded.cross_street, circuit_lights.cross_street),
                             sequence = COALESCE(excluded.sequence, circuit_lights.sequence),
-                            location_note = COALESCE(excluded.location_note, circuit_lights.location_note)
+                            location_note = COALESCE(excluded.location_note, circuit_lights.location_note),
+                            fixture_type = COALESCE(excluded.fixture_type, circuit_lights.fixture_type),
+                            pole_material = COALESCE(excluded.pole_material, circuit_lights.pole_material),
+                            pole_height = COALESCE(excluded.pole_height, circuit_lights.pole_height)
                         """,
                         (
                             circ.get("id"),
@@ -3023,6 +3033,9 @@ def page_circuits(conn: sqlite3.Connection) -> None:
                             (row.get("cross_street") or "").strip() or None,
                             seq,
                             loc,
+                            fixture,
+                            pole_m,
+                            pole_h,
                         ),
                     )
                     n += 1
