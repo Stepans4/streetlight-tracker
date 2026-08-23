@@ -548,6 +548,62 @@ def format_callout(street: str, side: str, nth, from_dir: str, cross: str) -> st
     return "-".join(bits)
 
 
+def parse_shop_location(text: str) -> dict:
+    """
+    Crew location: 7 E 2 N Hadley
+    street, side of street, nth from cross, dir from cross, cross street.
+    """
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    empty = {"street": "", "side": "", "nth": "", "from_dir": "", "cross": "", "spoken": "", "compact": ""}
+    if not raw:
+        return empty
+    m = re.match(
+        r"^(\S+)\s+([NSEWCnsewc])\s+(\d+)\s+([NSEW@nsew]|at)\s+(.+)$",
+        raw,
+    )
+    if not m:
+        return empty
+    street, side, nth, from_dir, cross = m.groups()
+    if from_dir.lower() == "at":
+        from_dir = "@"
+    spoken = spoken_callout(street, side, nth, from_dir, cross)
+    compact = format_callout(street, side, nth, from_dir, cross)
+    return {
+        "street": street,
+        "side": side.upper(),
+        "nth": nth,
+        "from_dir": from_dir.upper() if from_dir != "@" else "@",
+        "cross": cross.strip(),
+        "spoken": spoken,
+        "compact": compact,
+    }
+
+
+def light_alias_keys(row: dict) -> set[str]:
+    keys = {loc_key(row.get("light_number")), loc_key(row.get("map_number"))}
+    spoken = spoken_callout(
+        row.get("street") or "",
+        row.get("side") or "",
+        row.get("nth"),
+        row.get("from_dir") or "",
+        row.get("cross_street") or "",
+    )
+    compact = format_callout(
+        row.get("street") or "",
+        row.get("side") or "",
+        row.get("nth"),
+        row.get("from_dir") or "",
+        row.get("cross_street") or "",
+    )
+    keys.add(loc_key(spoken))
+    keys.add(loc_key(compact))
+    shop = parse_shop_location(str(row.get("light_number") or ""))
+    if shop.get("spoken"):
+        keys.add(loc_key(shop["spoken"]))
+        keys.add(loc_key(shop["compact"]))
+    return {k for k in keys if k}
+
+
 def spoken_callout(street: str, side: str, nth, from_dir: str, cross: str) -> str:
     """1 W 1 N Mason"""
     bits = []
@@ -654,26 +710,42 @@ def seq_tokens(value: str | int | None) -> list:
     return tokens
 
 
+def seq_pos_branch(value: str | int | None) -> tuple[int | None, list]:
+    """
+    Shop numbering: leading number = order along the leg.
+    The rest is the leg id.
+      1a1 → pos 1, branch a1
+      1a2 → pos 1, branch a2   (split from 1a, NOT after 1a1)
+      2a2 → pos 2, branch a2   (next head on the a2 leg)
+    """
+    tokens = seq_tokens(value)
+    if not tokens:
+        return None, []
+    if isinstance(tokens[0], int):
+        return tokens[0], tokens[1:]
+    return None, tokens
+
+
 def seq_sort_key(value: str | int | None) -> tuple:
+    pos, branch = seq_pos_branch(value)
     parts = []
-    for t in seq_tokens(value):
+    for t in branch:
         if isinstance(t, int):
             parts.append((0, t, ""))
         else:
             parts.append((1, 0, t))
-    return tuple(parts)
+    return (tuple(parts), pos if pos is not None else 0)
 
 
 def branch_label(value: str | int | None) -> str:
-    """Visual branch indicator from sequence (1a2 → A leg, 1 → Main / feed)."""
-    tokens = seq_tokens(value)
-    if not tokens:
-        return "—"
-    for t in tokens:
-        if isinstance(t, str) and t:
-            letter = t[0].upper()
-            return f"{letter} leg"
-    return "Main / feed"
+    """1a2 → A2 leg, 2a2 → A2 leg, 1 → Main / feed."""
+    _pos, branch = seq_pos_branch(value)
+    if not branch:
+        return "Main / feed"
+    bits = []
+    for t in branch:
+        bits.append(str(t).upper() if isinstance(t, str) else str(t))
+    return f"{''.join(bits)} leg"
 
 
 def branch_depth(value: str | int | None) -> int:
@@ -782,23 +854,44 @@ def format_sequence_tree(lights: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def same_branch_at_or_after(newer, older) -> bool:
-    """True if newer is on older's branch at or past older (1a2 after 1a, not after 1b)."""
-    a = seq_tokens(older)
-    b = seq_tokens(newer)
-    if not a or not b:
-        return False
-    if b == a:
+def _branch_same_or_child(newer_br: list, older_br: list) -> bool:
+    """a2 is on/under a; a2 is not under a1."""
+    if newer_br == older_br:
         return True
-    return len(b) > len(a) and b[: len(a)] == a
+    if not older_br:
+        return True
+    if not newer_br:
+        return False
+    return len(newer_br) >= len(older_br) and newer_br[: len(older_br)] == older_br
+
+
+def same_branch_at_or_after(newer, older) -> bool:
+    """
+    2a2 is at/after 1a2 (same a2 leg, later count).
+    1a2 is at/after 1a (a2 split off a).
+    2a2 is NOT after 1a1 (other split).
+    """
+    npos, nbr = seq_pos_branch(newer)
+    opos, obr = seq_pos_branch(older)
+    if npos is None or opos is None:
+        return False
+    if not _branch_same_or_child(nbr, obr):
+        return False
+    if nbr == obr:
+        return npos >= opos
+    return True
 
 
 def same_branch_after(newer, older) -> bool:
-    a = seq_tokens(older)
-    b = seq_tokens(newer)
-    if not a or not b:
+    npos, nbr = seq_pos_branch(newer)
+    opos, obr = seq_pos_branch(older)
+    if npos is None or opos is None:
         return False
-    return len(b) > len(a) and b[: len(a)] == a
+    if not _branch_same_or_child(nbr, obr):
+        return False
+    if nbr == obr:
+        return npos > opos
+    return True
 
 
 def ranges_overlap_same_branch(new_lub, new_fud, old_lub, old_fud) -> bool:
@@ -845,7 +938,8 @@ def light_affected_by_ticket(conn, circuit_number: str, ticket: dict, light_numb
     t_fud = get_light_sequence(conn, circuit_number, ticket.get("fud") or "")
     t_lub = get_light_sequence(conn, circuit_number, ticket.get("lub") or "")
     t_light = get_light_sequence(conn, circuit_number, ticket.get("light_number") or "")
-    dark_from = t_fud if t_fud is not None else t_light
+    t_loc = get_light_sequence(conn, circuit_number, ticket.get("location") or "")
+    dark_from = t_fud or t_light or t_loc
     if t_lub and same_branch_after(seq, t_lub):
         return f"same leg after LUB {ticket.get('lub')}"
     if dark_from and same_branch_at_or_after(seq, dark_from):
@@ -880,14 +974,14 @@ def lookup_active_warnings(
                 f"(LUB {t.get('lub') or '—'} / FUD {t.get('fud') or t.get('light_number') or '—'})."
             )
     if ln and not notes:
-        # circuit busy but this head not proven downstream
         bits = [
             f"#{t.get('id')} {display_ticket_type(t.get('ticket_type'))}"
             for t in tickets
         ]
         notes.append(
-            f"**{circuit_number}** has active call(s) {', '.join(bits)} — "
-            "this head is not mapped as same-leg downstream (map sequences to refine)."
+            f"**{circuit_number}** has active call(s) {', '.join(bits)}. "
+            "Could not place this head after the LUB/FUD on the map "
+            "(check sequence and that FUD uses the same street / side / nth / cross)."
         )
     return notes
 
@@ -903,18 +997,25 @@ def get_light_sequence(conn, circuit_number: str, light_number: str) -> str | No
     lights = q_all(
         conn,
         """
-        SELECT cl.sequence, cl.light_number, cl.map_number
+        SELECT cl.sequence, cl.light_number, cl.map_number,
+               cl.street, cl.side, cl.nth, cl.from_dir, cl.cross_street
         FROM circuit_lights cl
         JOIN circuits c ON c.id = cl.circuit_id
         WHERE c.circuit_number = ?
         """,
         (circuit_number.strip(),),
     )
-    want = loc_key(light_number)
-    if not want:
+    shop = parse_shop_location(light_number)
+    wants = {loc_key(light_number)}
+    if shop.get("spoken"):
+        wants.add(loc_key(shop["spoken"]))
+        wants.add(loc_key(shop["compact"]))
+    wants = {w for w in wants if w}
+    if not wants:
         return None
     for row in lights:
-        if loc_key(row.get("light_number")) == want or loc_key(row.get("map_number")) == want:
+        aliases = light_alias_keys(row)
+        if aliases & wants:
             if row.get("sequence") not in (None, ""):
                 return normalize_seq(row["sequence"])
             return None
@@ -940,7 +1041,7 @@ def loc_keys_match(a, b) -> bool:
 
 def ticket_units(row) -> list[str]:
     units = []
-    for key in ("light_number", "lub", "fud"):
+    for key in ("light_number", "lub", "fud", "location"):
         val = _norm(str(row_get(row, key, "") or ""))
         if val:
             units.append(val)
@@ -2288,8 +2389,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
     st.header("Circuits & maps")
     st.caption(
         "Upload circuit PDFs and enter light order from the source. "
-        "Sequences can be nested (`1`, `1a`, `1a1`, `1b`) so parallel legs stay separate. "
-        "Same-leg downstream only is flagged as the same break."
+        "Sequence: leading number is order on that leg (`1a2` then `2a2`). "
+        "`1a1` and `1a2` are a **split**, not one after the other."
     )
 
     can_edit = is_supervisor()
@@ -2606,7 +2707,8 @@ def page_circuits(conn: sqlite3.Connection) -> None:
         st.caption(
             "Identify the head by **Location** (street, side, nth light from the cross, and cross street) "
             "plus **Light #** if you have it. Light # can repeat on other streets. "
-            "Sequence from the print: `1`, `1a`, `1a1`, `1b`."
+            "Splits: `1a1`/`1a2`, then `1a1a`/`1a1b`, then `1a1a1`/`1a1a2`. "
+            "Next head on the same leg bumps the first number: `2a1a` after `1a1a`."
         )
         with st.form("add_light"):
             cn2 = st.text_input("Circuit number", key="al_cn")
@@ -2624,7 +2726,7 @@ def page_circuits(conn: sqlite3.Connection) -> None:
             seq = st.text_input(
                 "Sequence from source",
                 placeholder="1   or  1a   or  1a2",
-                help="Use 1, 1a, 1b, 1a1, 1a2 for splits. Same-leg only is treated as downstream.",
+                help="Splits add a letter or digit (1a1a / 1a1b). Same-leg next head is 2a1a, not 1a1b.",
             )
             loc = st.text_input("Location note")
             p1, p2, p3 = st.columns(3)
@@ -3057,6 +3159,16 @@ def parse_address_query(text: str) -> dict:
     if not streets:
         streets = [t for t in out["tokens"] if t.isalpha() and not _cardinal(t)]
     out["streets"] = streets
+    shop = parse_shop_location(raw)
+    out["shop"] = shop
+    if shop.get("street"):
+        # Crew typed a light location, not a house address
+        out["house"] = None
+        out["side"] = shop["side"]
+        out["street_prefix"] = ""
+        out["runs"] = ""
+        streets = [shop["street"], shop["cross"]] if shop.get("cross") else [shop["street"]]
+        out["streets"] = [s for s in streets if s]
     return out
 
 
@@ -3074,6 +3186,26 @@ def address_match_score(light: dict, parsed: dict) -> tuple[int, list[str]]:
     """Higher is better. Reasons explain the hit."""
     reasons = []
     score = 0
+    shop = parsed.get("shop") or {}
+    if shop.get("street"):
+        if loc_keys_match(light.get("street"), shop["street"]) or loc_key(shop["street"]) in loc_key(light.get("street")):
+            score += 40
+            reasons.append(f"street {shop['street']}")
+        if shop.get("side") and str(light.get("side") or "").upper() == shop["side"]:
+            score += 30
+            reasons.append(f"side {shop['side']}")
+        if shop.get("cross") and loc_key(shop["cross"]) in loc_key(light.get("cross_street")):
+            score += 35
+            reasons.append(f"cross {shop['cross']}")
+        if shop.get("nth") and str(light.get("nth") or "") == str(shop["nth"]):
+            score += 20
+            reasons.append(f"nth {shop['nth']}")
+        aliases = light_alias_keys(light)
+        if loc_key(shop.get("spoken")) in aliases or loc_key(shop.get("compact")) in aliases:
+            score += 50
+            reasons.append("exact shop location")
+        if reasons and score >= 40:
+            return score, reasons
     blob = " ".join(
         str(light.get(k) or "")
         for k in (
@@ -3532,21 +3664,28 @@ def page_address_search(conn) -> None:
     st.subheader("Nearest stored lights (by map # and street text)")
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     seen_notes = set()
-    for cn, _n in top[:8]:
-        for note in lookup_active_warnings(conn, str(cn)):
-            if note not in seen_notes:
-                seen_notes.add(note)
-                st.warning(note)
+    qtxt = q.strip()
     for h in hits[:12]:
-        for note in lookup_active_warnings(
-            conn,
-            str(h.get("circuit_number") or ""),
-            light_number=str(h.get("light_number") or ""),
-            sequence=str(h.get("sequence") or ""),
+        for probe in (
+            str(h.get("light_number") or ""),
+            qtxt,
+            spoken_callout(
+                h.get("street") or "",
+                h.get("side") or "",
+                h.get("nth"),
+                h.get("from_dir") or "",
+                h.get("cross_street") or "",
+            ),
         ):
-            if note not in seen_notes:
-                seen_notes.add(note)
-                st.warning(note)
+            for note in lookup_active_warnings(
+                conn,
+                str(h.get("circuit_number") or ""),
+                light_number=probe,
+                sequence=str(h.get("sequence") or ""),
+            ):
+                if note not in seen_notes:
+                    seen_notes.add(note)
+                    st.warning(note)
 
 
 def circuit_lights_list(conn, circuit_number: str) -> list[dict]:
