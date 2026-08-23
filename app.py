@@ -30,6 +30,7 @@ TICKET_TYPES = [
     "Damage",
     "Knockdown",
     "Tag Out",
+    "Temporary OH",
     "Bad Ballast",
     "Bad Ignitor",
     "Bad Fixture",
@@ -49,6 +50,7 @@ TICKET_TYPE_ALIASES = {
     "Tag out": "Tag Out",
 }
 TAG_OUT_TYPES = {"Tag Out", "Tag out"}
+TEMP_OH_TYPES = {"Temporary OH"}
 PEDESTAL_CUT_TYPES = {"Wires Cut in pedestal", "Pedestal cut"}
 COMPONENT_TYPES = {"Bad Fixture", "Bad fixture", "Bad Ignitor", "Bad igniter", "Bad Ballast"}
 OUTAGE_CAUSES = [
@@ -66,6 +68,7 @@ BOARD_FILTERS = [
     "Damages",
     "Theft / vandalism",
     "Tag outs",
+    "Temporary OH",
     "Knockdowns",
     "Fixture / component",
     "UGT",
@@ -480,6 +483,10 @@ def _migrate_tickets(conn) -> None:
             "photo_data": "ALTER TABLE tickets ADD COLUMN photo_data TEXT",
             "is_tag_out": "ALTER TABLE tickets ADD COLUMN is_tag_out INTEGER NOT NULL DEFAULT 0",
             "tag_reason": "ALTER TABLE tickets ADD COLUMN tag_reason TEXT",
+            "oh_from_seq": "ALTER TABLE tickets ADD COLUMN oh_from_seq TEXT",
+            "oh_to_seq": "ALTER TABLE tickets ADD COLUMN oh_to_seq TEXT",
+            "oh_from_loc": "ALTER TABLE tickets ADD COLUMN oh_from_loc TEXT",
+            "oh_to_loc": "ALTER TABLE tickets ADD COLUMN oh_to_loc TEXT",
         }
         for name, sql in adds.items():
             if name not in cols:
@@ -914,7 +921,8 @@ def active_tickets_on_circuit(conn, circuit_number: str) -> list[dict]:
         conn,
         """
         SELECT id, ticket_type, light_number, lub, fud, pedestal_cut, is_tag_out,
-               location, created_at, work_order
+               location, created_at, work_order, description, tag_reason,
+               oh_from_seq, oh_to_seq, oh_from_loc, oh_to_loc
         FROM tickets
         WHERE status = 'active' AND circuit_number = ?
         ORDER BY created_at
@@ -933,6 +941,14 @@ def light_affected_by_ticket(conn, circuit_number: str, ticket: dict, light_numb
     ttype = display_ticket_type(ticket.get("ticket_type"))
     if int(ticket.get("is_tag_out") or 0) == 1 or ttype in TAG_OUT_TYPES:
         return "circuit is tagged out"
+    if ttype in TEMP_OH_TYPES:
+        oh_f = _norm(ticket.get("oh_from_seq"))
+        oh_t = _norm(ticket.get("oh_to_seq"))
+        if sequence_near_temp_oh(seq or "", oh_f, oh_t):
+            take = _norm(ticket.get("oh_from_loc")) or oh_f or "—"
+            land = _norm(ticket.get("oh_to_loc")) or oh_t or "—"
+            return f"temporary OH jumper in — map order not in effect ({take} → {land})"
+        return None
     if not seq:
         return None
     t_fud = get_light_sequence(conn, circuit_number, ticket.get("fud") or "")
@@ -964,9 +980,22 @@ def lookup_active_warnings(
         ttype = display_ticket_type(t.get("ticket_type"))
         detail = light_affected_by_ticket(conn, circuit_number, t, ln, sequence)
         if detail:
+            if ttype in TEMP_OH_TYPES or "temporary OH" in (detail or ""):
+                notes.append(
+                    f"**{circuit_number}** · active **Temporary OH #{tid}** — {detail}. "
+                    "Do not trust printed UG sequence for LUB/FUD until OH is taken down."
+                )
+            else:
+                notes.append(
+                    f"**{circuit_number}** · this light is under active **#{tid} {ttype}** — {detail} "
+                    f"(LUB {t.get('lub') or '—'} / FUD {t.get('fud') or '—'})."
+                )
+        elif not ln and ttype in TEMP_OH_TYPES:
             notes.append(
-                f"**{circuit_number}** · this light is under active **#{tid} {ttype}** — {detail} "
-                f"(LUB {t.get('lub') or '—'} / FUD {t.get('fud') or '—'})."
+                f"**{circuit_number}** has active **Temporary OH #{tid}** "
+                f"({_norm(t.get('oh_from_loc')) or t.get('oh_from_seq') or '—'} → "
+                f"{_norm(t.get('oh_to_loc')) or t.get('oh_to_seq') or '—'}). "
+                "Map order may not match the field."
             )
         elif not ln:
             notes.append(
@@ -1020,6 +1049,40 @@ def get_light_sequence(conn, circuit_number: str, light_number: str) -> str | No
                 return normalize_seq(row["sequence"])
             return None
     return None
+
+
+def sequence_near_temp_oh(seq: str, oh_from: str, oh_to: str) -> bool:
+    seq_n = normalize_seq(seq)
+    if not seq_n:
+        return True
+    anchors = [normalize_seq(oh_from), normalize_seq(oh_to)]
+    anchors = [a for a in anchors if a]
+    if not anchors:
+        return True
+    _, sb = seq_pos_branch(seq_n)
+    for a in anchors:
+        if same_branch_at_or_after(seq_n, a) or same_branch_at_or_after(a, seq_n):
+            return True
+        _, ab = seq_pos_branch(a)
+        if sb and ab and sb[0] == ab[0]:
+            return True
+        if not sb and not ab:
+            return True
+    return False
+
+
+def resolve_oh_anchor(conn, circuit_number: str, pole_or_seq: str) -> tuple[str | None, str]:
+    """Pole location or Light # → mapped sequence. A typed sequence like 1a2 still works."""
+    raw = _norm(pole_or_seq)
+    if not raw:
+        return None, ""
+    seq = get_light_sequence(conn, circuit_number, raw)
+    if seq:
+        return seq, raw
+    err = validate_sequence_or_error(raw)
+    if not err:
+        return normalize_seq(raw), raw
+    return None, raw
 
 
 def _norm(value: str | None) -> str:
@@ -1161,8 +1224,12 @@ def insert_ticket(
     photo_data: str = "",
     is_tag_out: bool = False,
     tag_reason: str = "",
+    oh_from_seq: str = "",
+    oh_to_seq: str = "",
+    oh_from_loc: str = "",
+    oh_to_loc: str = "",
 ) -> tuple[int, bool, str]:
-    skip_dup = is_tag_out or ticket_type in TAG_OUT_TYPES
+    skip_dup = is_tag_out or ticket_type in TAG_OUT_TYPES or ticket_type in TEMP_OH_TYPES
     if skip_dup:
         flagged, reason, parent = False, "", None
     else:
@@ -1174,8 +1241,8 @@ def insert_ticket(
             location, description,
             status, is_flagged, flag_reason, parent_ticket_id, created_at,
             work_order, created_by, outage_cause, photo_name, photo_data,
-            is_tag_out, tag_reason
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            is_tag_out, tag_reason, oh_from_seq, oh_to_seq, oh_from_loc, oh_to_loc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             ticket_type,
@@ -1198,6 +1265,10 @@ def insert_ticket(
             photo_data or None,
             1 if (is_tag_out or ticket_type in TAG_OUT_TYPES) else 0,
             _norm(tag_reason) or None,
+            _norm(oh_from_seq) or None,
+            _norm(oh_to_seq) or None,
+            _norm(oh_from_loc) or None,
+            _norm(oh_to_loc) or None,
         ),
     )
     conn.commit()
@@ -1513,6 +1584,10 @@ def update_active_ticket(
     tag_reason: str,
     pedestal_cut: bool,
     is_tag_out: bool,
+    oh_from_seq: str = "",
+    oh_to_seq: str = "",
+    oh_from_loc: str = "",
+    oh_to_loc: str = "",
 ) -> None:
     ttype = ticket_type
     tag = 1 if (is_tag_out or ttype in TAG_OUT_TYPES) else 0
@@ -1531,7 +1606,11 @@ def update_active_ticket(
             outage_cause = ?,
             tag_reason = ?,
             pedestal_cut = ?,
-            is_tag_out = ?
+            is_tag_out = ?,
+            oh_from_seq = ?,
+            oh_to_seq = ?,
+            oh_from_loc = ?,
+            oh_to_loc = ?
         WHERE id = ? AND status = 'active'
         """,
         (
@@ -1548,6 +1627,10 @@ def update_active_ticket(
             _norm(tag_reason) or None,
             1 if pedestal_cut or ttype in PEDESTAL_CUT_TYPES else 0,
             tag,
+            _norm(oh_from_seq) or None,
+            _norm(oh_to_seq) or None,
+            _norm(oh_from_loc) or None,
+            _norm(oh_to_loc) or None,
             int(ticket_id),
         ),
     )
@@ -1595,6 +1678,8 @@ def board_category(row) -> str:
         return "UGT"
     if t in ("Damage", "Deteriorated Pole", "Damaged Pedestal"):
         return "Damages"
+    if t in TEMP_OH_TYPES:
+        return "Temporary OH"
     if t in ("Trouble", "Outage") or t in PEDESTAL_CUT_TYPES or row.get("lub") or row.get("fud"):
         return "Circuit troubles (LUB/FUD)"
     return "All"
@@ -1938,6 +2023,20 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             "Location",
             placeholder="1st & Mason — or leave blank and use the boxes above",
         )
+        st.markdown("**Temporary OH (overhead jumper)**")
+        st.caption(
+            "Type **Temporary OH**. Enter **pole locations** (shop callout or Light #). "
+            "The circuit map fills in sequence. Complete the call when OH comes down."
+        )
+        oh1, oh2 = st.columns(2)
+        oh_from_loc = oh1.text_input(
+            "OH takeoff pole",
+            placeholder="N 7 E 2 N Hadley  or  305",
+        )
+        oh_to_loc = oh2.text_input(
+            "OH landing pole",
+            placeholder="N 7 E 1 S Juneau  or  312",
+        )
         st.markdown("**Tag out (circuit or area locked out)**")
         is_tag = st.checkbox("This is a tag out")
         tag_reason = st.text_input(
@@ -1961,12 +2060,37 @@ def page_new_call(conn: sqlite3.Connection) -> None:
         spoken = spoken_callout(street, side, nth if nth else "", from_dir, cross)
         loc = location.strip() or spoken
         light_id = loc or (map_number or "").strip()
-        if not light_id and not is_tag:
+        ttype = "Tag Out" if is_tag else ticket_type
+        is_oh = ttype in TEMP_OH_TYPES
+        if not light_id and not is_tag and not is_oh:
             st.error("Enter Location, or Street + side + cross, or Light #.")
             return
-        ttype = "Tag Out" if is_tag else ticket_type
         if is_tag and not light_id:
             light_id = "TAGOUT"
+        if is_oh and not light_id:
+            light_id = "TEMPOH"
+        oh_from_seq = oh_to_seq = ""
+        if is_oh:
+            if not (oh_from_loc.strip() or oh_to_loc.strip()):
+                st.error("Temporary OH needs a **takeoff** and/or **landing** pole.")
+                return
+            fs, _ = resolve_oh_anchor(conn, circuit_number.strip(), oh_from_loc)
+            ts, _ = resolve_oh_anchor(conn, circuit_number.strip(), oh_to_loc)
+            missing = []
+            if oh_from_loc.strip() and not fs:
+                missing.append(f"takeoff **{oh_from_loc.strip()}**")
+            if oh_to_loc.strip() and not ts:
+                missing.append(f"landing **{oh_to_loc.strip()}**")
+            if missing:
+                st.error(
+                    "Could not map "
+                    + " and ".join(missing)
+                    + f" on **{circuit_number.strip()}**. "
+                    "Add that pole on Circuits & maps first, or type a sequence like 1a2."
+                )
+                return
+            oh_from_seq = fs or ""
+            oh_to_seq = ts or ""
         existing_tags = active_tagouts_for_circuit(conn, circuit_number)
         if existing_tags and not is_tag and not force_on_tag:
             msgs = "; ".join(
@@ -1997,6 +2121,11 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             extra.append(f"pole {pole_material} {pole_height}".strip())
         if fixture_type:
             extra.append(f"fixture {fixture_type}")
+        if is_oh:
+            extra.append(
+                f"OH jump {oh_from_loc.strip() or '—'} (seq {oh_from_seq or '—'}) → "
+                f"{oh_to_loc.strip() or '—'} (seq {oh_to_seq or '—'})"
+            )
         desc = description
         if extra:
             desc = ((description or "").strip() + "\n" + "; ".join(extra)).strip()
@@ -2018,8 +2147,12 @@ def page_new_call(conn: sqlite3.Connection) -> None:
             photo_data=photo_data,
             is_tag_out=is_tag or ttype in TAG_OUT_TYPES,
             tag_reason=tag_reason,
+            oh_from_seq=oh_from_seq if is_oh else "",
+            oh_to_seq=oh_to_seq if is_oh else "",
+            oh_from_loc=oh_from_loc if is_oh else "",
+            oh_to_loc=oh_to_loc if is_oh else "",
         )
-        if light_id and light_id != "TAGOUT":
+        if light_id and light_id not in ("TAGOUT", "TEMPOH"):
             log_light_event(
                 conn,
                 circuit_number,
@@ -2083,6 +2216,10 @@ def page_active(conn: sqlite3.Connection) -> None:
         "map_number",
         "lub",
         "fud",
+        "oh_from_loc",
+        "oh_to_loc",
+        "oh_from_seq",
+        "oh_to_seq",
         "outage_cause",
         "work_order",
         "created_by",
@@ -2104,6 +2241,10 @@ def page_active(conn: sqlite3.Connection) -> None:
         "map_number": "Light #",
         "lub": "LUB",
         "fud": "FUD",
+        "oh_from_loc": "OH takeoff pole",
+        "oh_to_loc": "OH landing pole",
+        "oh_from_seq": "OH from seq",
+        "oh_to_seq": "OH to seq",
         "outage_cause": "Cause",
         "work_order": "Record #",
         "created_by": "Crew",
@@ -2187,6 +2328,15 @@ def page_active(conn: sqlite3.Connection) -> None:
                     or str(row.get("ticket_type") or "") in PEDESTAL_CUT_TYPES,
                 )
                 elocation = st.text_input("Intersection", value=str(row.get("location") or ""))
+                eoh1, eoh2 = st.columns(2)
+                eoh_from = eoh1.text_input(
+                    "OH takeoff pole",
+                    value=str(row.get("oh_from_loc") or row.get("oh_from_seq") or ""),
+                )
+                eoh_to = eoh2.text_input(
+                    "OH landing pole",
+                    value=str(row.get("oh_to_loc") or row.get("oh_to_seq") or ""),
+                )
                 edesc = st.text_area("Notes", value=str(row.get("description") or ""))
                 etag = st.checkbox("This is a tag out", value=is_tag)
                 etag_r = st.text_input("Tag reason", value=str(row.get("tag_reason") or ""))
@@ -2195,6 +2345,8 @@ def page_active(conn: sqlite3.Connection) -> None:
                 if not ecirc.strip():
                     st.error("Circuit is required.")
                 else:
+                    efs, _ = resolve_oh_anchor(conn, ecirc.strip(), eoh_from)
+                    ets, _ = resolve_oh_anchor(conn, ecirc.strip(), eoh_to)
                     update_active_ticket(
                         conn,
                         int(pick),
@@ -2211,9 +2363,21 @@ def page_active(conn: sqlite3.Connection) -> None:
                         etag_r,
                         eped,
                         etag,
+                        oh_from_seq=efs or eoh_from,
+                        oh_to_seq=ets or eoh_to,
+                        oh_from_loc=eoh_from,
+                        oh_to_loc=eoh_to,
                     )
                     st.success(f"Ticket #{pick} updated.")
                     st.rerun()
+    if display_ticket_type(row.get("ticket_type")) in TEMP_OH_TYPES:
+        st.info(
+            f"Temporary OH: **{row.get('oh_from_loc') or row.get('oh_from_seq') or '—'}** "
+            f"(seq {row.get('oh_from_seq') or '—'}) → "
+            f"**{row.get('oh_to_loc') or row.get('oh_to_seq') or '—'}** "
+            f"(seq {row.get('oh_to_seq') or '—'}). "
+            "Mark completed when the overhead is removed."
+        )
     if is_tag:
         st.info(f"Tag reason: {row.get('tag_reason') or row.get('description') or '—'}")
         rel_note = st.text_input("Release note", value="Tag released — circuit clear", key="rel_note")
@@ -3658,6 +3822,31 @@ def page_address_search(conn) -> None:
         hide_index=True,
         use_container_width=True,
     )
+
+    oh_notes = []
+    seen_oh = set()
+    for h in hits[:40]:
+        cn = str(h.get("circuit_number") or "")
+        seq = str(h.get("sequence") or "")
+        for t in active_tickets_on_circuit(conn, cn):
+            if display_ticket_type(t.get("ticket_type")) not in TEMP_OH_TYPES:
+                continue
+            key = (cn, t.get("id"))
+            if key in seen_oh:
+                continue
+            if sequence_near_temp_oh(seq, _norm(t.get("oh_from_seq")), _norm(t.get("oh_to_seq"))):
+                seen_oh.add(key)
+                take = _norm(t.get("oh_from_loc")) or _norm(t.get("oh_from_seq")) or "—"
+                land = _norm(t.get("oh_to_loc")) or _norm(t.get("oh_to_seq")) or "—"
+                oh_notes.append(
+                    f"**Temporary OH on {cn}** · call **#{t.get('id')}** · "
+                    f"**{take} → {land}** (near this address / leg). "
+                    "**UG map order is not in effect** until OH is removed."
+                )
+    if oh_notes:
+        st.subheader("Temporary overhead near this address")
+        for n in oh_notes:
+            st.warning(n)
 
     rows = []
     for h in hits[:80]:
