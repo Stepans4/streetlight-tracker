@@ -1664,31 +1664,40 @@ def complete_ticket(
 
 
 def board_category(row) -> str:
-    """Classify a ticket for active-board filters."""
-    t = str(row.get("ticket_type") or "")
-    if int(row.get("is_tag_out") or 0) == 1 or t in TAG_OUT_TYPES:
-        return "Tag outs"
-    if t in ("Cable Theft", "Wire stolen", "Vandalism"):
-        return "Theft / vandalism"
-    if t == "Knockdown":
-        return "Knockdowns"
-    if t in COMPONENT_TYPES:
-        return "Fixture / component"
-    if t == "UGT":
-        return "UGT"
-    if t in ("Damage", "Deteriorated Pole", "Damaged Pedestal"):
-        return "Damages"
-    if t in TEMP_OH_TYPES:
-        return "Temporary OH"
-    if t in ("Trouble", "Outage") or t in PEDESTAL_CUT_TYPES or row.get("lub") or row.get("fud"):
-        return "Circuit troubles (LUB/FUD)"
-    return "All"
+    """Legacy single category label (print / older filters). Prefer ticket type filters."""
+    return display_ticket_type(row.get("ticket_type")) or "Other"
 
 
-def filter_board(df: pd.DataFrame, board_filter: str) -> pd.DataFrame:
-    if df.empty or board_filter == "All":
+def ticket_matches_type_filters(row, selected: list[str]) -> bool:
+    """True if ticket matches any selected New-call type (empty selected = show all)."""
+    if not selected:
+        return True
+    raw = str(row.get("ticket_type") or "")
+    shown = display_ticket_type(raw)
+    if shown in selected or raw in selected:
+        return True
+    if "Tag Out" in selected and (
+        int(row.get("is_tag_out") or 0) == 1 or raw in TAG_OUT_TYPES
+    ):
+        return True
+    if "Temporary OH" in selected and shown in TEMP_OH_TYPES:
+        return True
+    return False
+
+
+def filter_board(df: pd.DataFrame, board_filter) -> pd.DataFrame:
+    """Filter active board by one or more call types (same list as New call)."""
+    if df.empty:
         return df
-    mask = df.apply(lambda r: board_category(r) == board_filter, axis=1)
+    if isinstance(board_filter, str):
+        if board_filter in ("", "All"):
+            return df
+        selected = [board_filter]
+    else:
+        selected = list(board_filter or [])
+        if not selected:
+            return df
+    mask = df.apply(lambda r: ticket_matches_type_filters(r, selected), axis=1)
     return df[mask]
 
 
@@ -2186,25 +2195,30 @@ def page_active(conn: sqlite3.Connection) -> None:
         )
     df = tickets_df(conn, "active")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     q = c1.text_input("Search")
     circuit = c2.text_input("Circuit")
     wo = c3.text_input("Record #")
-    board = c4.selectbox("Board filter", BOARD_FILTERS)
+    type_filters = st.multiselect(
+        "Call type (same list as New call — check one or more)",
+        options=list(TICKET_TYPES),
+        default=[],
+        help="Leave empty to show every type. Check multiple to combine (e.g. Trouble + UGT + Cable Theft).",
+    )
     if not truck:
         light = st.text_input("Location")
-        ttype = st.selectbox("Type", ["All"] + TICKET_TYPES)
     else:
-        light, ttype = "", "All"
+        light = ""
 
-    filtered = filter_tickets(df, q, circuit, light, ttype, None, None, work_order=wo)
-    filtered = filter_board(filtered, board)
+    filtered = filter_tickets(df, q, circuit, light, "All", None, None, work_order=wo)
+    filtered = filter_board(filtered, type_filters)
 
     if filtered.empty:
         st.info("No active calls match.")
         return
 
-    st.write(f"**{len(filtered)}** active · **{board}**")
+    filter_label = ", ".join(type_filters) if type_filters else "All types"
+    st.write(f"**{len(filtered)}** active · **{filter_label}**")
 
     cols = [
         "id",
@@ -2268,7 +2282,7 @@ def page_active(conn: sqlite3.Connection) -> None:
 
     if not truck:
         st.subheader("Print active board")
-        html = build_print_board_html(filtered, title=f"Active board — {board}")
+        html = build_print_board_html(filtered, title=f"Active board — {filter_label}")
         st.download_button(
             "Download board for print (HTML)",
             html.encode("utf-8"),
