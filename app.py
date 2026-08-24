@@ -307,8 +307,15 @@ def require_login() -> bool:
             role = current_role()
             st.caption(f"**{who}** · {role}")
             if st.button("Log out"):
-                for k in ("authenticated", "auth_user", "auth_name", "auth_role"):
-                    st.session_state[k] = None if k != "authenticated" else False
+                for k in (
+                    "authenticated",
+                    "auth_user",
+                    "auth_name",
+                    "auth_role",
+                    "active_type_filters",
+                ):
+                    st.session_state.pop(k, None)
+                st.session_state["authenticated"] = False
                 st.rerun()
         return True
 
@@ -2199,11 +2206,13 @@ def page_active(conn: sqlite3.Connection) -> None:
     q = c1.text_input("Search")
     circuit = c2.text_input("Circuit")
     wo = c3.text_input("Record #")
+    if "active_type_filters" not in st.session_state:
+        st.session_state.active_type_filters = []
     type_filters = st.multiselect(
         "Call type (same list as New call — check one or more)",
         options=list(TICKET_TYPES),
-        default=[],
-        help="Leave empty to show every type. Check multiple to combine (e.g. Trouble + UGT + Cable Theft).",
+        key="active_type_filters",
+        help="Leave empty to show every type. Stays checked until you change it or log out.",
     )
     if not truck:
         light = st.text_input("Location")
