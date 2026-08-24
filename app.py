@@ -3776,6 +3776,7 @@ def page_address_search(conn) -> None:
         return
 
     hits, parsed = search_lights_by_address(conn, q)
+    hits = hits[:10]
     nearby_calls = search_active_tickets_by_address(conn, parsed)
     bits = []
     if parsed.get("house") is not None:
@@ -3818,16 +3819,15 @@ def page_address_search(conn) -> None:
         st.warning("No stored lights matched. Add the nearby heads on Circuits & maps, then search again.")
         return
 
-    st.write(f"**{len(hits)}** matching light(s)")
+    st.write(f"**{len(hits)}** closest matching light(s) (max 10)")
 
-    # Circuit summary first
+    # Circuit summary (no leg / sequence labels)
     by_c: dict[str, dict] = {}
     for h in hits:
         cn = h.get("circuit_number") or "?"
-        d = by_c.setdefault(cn, {"n": 0, "score": 0, "legs": set()})
+        d = by_c.setdefault(cn, {"n": 0, "score": 0})
         d["n"] += 1
         d["score"] = max(d["score"], int(h.get("score") or 0))
-        d["legs"].add(branch_label(h.get("sequence")))
     top = sorted(by_c.items(), key=lambda kv: (-kv[1]["score"], -kv[1]["n"]))
     st.subheader("Likely circuit(s)")
     st.dataframe(
@@ -3837,7 +3837,6 @@ def page_address_search(conn) -> None:
                     "Circuit": c,
                     "Best score": d["score"],
                     "Matching lights": d["n"],
-                    "Legs": ", ".join(sorted(x for x in d["legs"] if x and x != "—")),
                 }
                 for c, d in top
             ]
@@ -3848,7 +3847,7 @@ def page_address_search(conn) -> None:
 
     oh_notes = []
     seen_oh = set()
-    for h in hits[:40]:
+    for h in hits:
         cn = str(h.get("circuit_number") or "")
         seq = str(h.get("sequence") or "")
         for t in active_tickets_on_circuit(conn, cn):
@@ -3863,7 +3862,7 @@ def page_address_search(conn) -> None:
                 land = _norm(t.get("oh_to_loc")) or _norm(t.get("oh_to_seq")) or "—"
                 oh_notes.append(
                     f"**Temporary OH on {cn}** · call **#{t.get('id')}** · "
-                    f"**{take} → {land}** (near this address / leg). "
+                    f"**{take} → {land}** (near this address). "
                     "**UG map order is not in effect** until OH is removed."
                 )
     if oh_notes:
@@ -3872,7 +3871,7 @@ def page_address_search(conn) -> None:
             st.warning(n)
 
     rows = []
-    for h in hits[:80]:
+    for h in hits:
         rows.append(
             {
                 "Score": h["score"],
@@ -3880,17 +3879,15 @@ def page_address_search(conn) -> None:
                 "Location": h.get("light_number"),
                 "Light #": h.get("map_number") or "",
                 "Side": h.get("side") or "",
-                "Seq": h.get("sequence") or "",
-                "Branch": branch_label(h.get("sequence")),
                 "Why": "; ".join(h["reasons"]),
                 "Note": h.get("location_note") or "",
             }
         )
-    st.subheader("Nearest stored lights (by map # and street text)")
+    st.subheader("Nearest stored lights")
     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
     seen_notes = set()
     qtxt = q.strip()
-    for h in hits[:12]:
+    for h in hits:
         for probe in (
             str(h.get("light_number") or ""),
             qtxt,
